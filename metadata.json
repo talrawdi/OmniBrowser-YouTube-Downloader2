@@ -1,0 +1,6 @@
+{
+  "name": "OmniBrowser",
+  "description": "متصفح إنترنت ذكي ومتكامل مع كشف وتحميل الفيديو والترجمة الفورية، وتشغيل الفيديو أثناء التنزيل وحظر الإعلانات وحماية الخصوصية",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
