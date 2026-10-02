@@ -754,9 +754,8 @@ object DownloadManager {
     }
 
     /**
-     * Dedicated YouTube & GoogleVideo Chunked Stream Downloader.
-     * Uses consecutive Range requests with full session headers & cookies
-     * to safely and reliably stream high-speed un-throttled MP4 data without IP binding or 403 errors.
+     * Dedicated YouTube & GoogleVideo Stream Downloader.
+     * Streams video directly with Range headers, and auto-resolves fresh proxy streams if expired or blocked.
      */
     private suspend fun downloadYouTubeChunkedStream(
         context: Context,
@@ -765,8 +764,11 @@ object DownloadManager {
         db: AppDatabase,
         resume: Boolean
     ) = withContext(Dispatchers.IO) {
-        DiagnosticLogger.i("Downloader", "بدء تنزيل مقطع يوتيوب عبر تقنية الأجزاء المباشرة المتتالية (Chunked Range Engine)...")
-        val currentUrl = entity.url
+        DiagnosticLogger.i("Downloader", "بدء تنزيل مقطع يوتيوب: '${entity.title}'...")
+        var currentUrl = entity.url
+        val videoId = MediaSniffer.extractYouTubeVideoId(entity.pageUrl ?: currentUrl)
+            ?: YouTubeExtractor.extractVideoId(currentUrl)
+            ?: YouTubeExtractor.extractVideoId(entity.pageUrl.orEmpty())
 
         val savedHeaders = MediaSniffer.capturedHeaders[currentUrl]
             ?: MediaSniffer.capturedHeaders[MediaSniffer.cleanRangeParams(currentUrl)]
@@ -780,159 +782,161 @@ object DownloadManager {
             CookieManager.getInstance().getCookie("https://www.youtube.com")
         }.getOrNull().orEmpty()
 
-        // 1. Determine Total Bytes:
-        var totalBytes = runCatching { Uri.parse(currentUrl).getQueryParameter("clen")?.toLongOrNull() }.getOrNull() ?: 0L
-        if (totalBytes <= 0L && entity.totalBytes > 0L) {
-            totalBytes = entity.totalBytes
-        }
-
-        // Clean url base (strip existing range param so we can supply our own range parameters)
-        val cleanBaseUrl = currentUrl.replace(Regex("&range=[0-9]+-[0-9]+"), "")
-            .replace(Regex("\\?range=[0-9]+-[0-9]+&"), "?")
-            .replace(Regex("\\?range=[0-9]+-[0-9]+$"), "")
-
-        // If totalBytes is still unknown, probe with a tiny 0-1 range probe
-        if (totalBytes <= 0L) {
-            try {
-                val probeReq = Request.Builder()
-                    .url(if (cleanBaseUrl.contains("?")) "$cleanBaseUrl&range=0-1" else "$cleanBaseUrl?range=0-1")
-                    .header("User-Agent", webUserAgent)
-                    .header("Referer", referer)
-                    .header("Origin", "https://www.youtube.com")
-                    .apply { if (cookies.isNotBlank()) header("Cookie", cookies) }
-                    .header("Range", "bytes=0-1")
-                    .build()
-
-                okHttpClient.newCall(probeReq).execute().use { resp ->
-                    val contentRange = resp.header("Content-Range")
-                    val probedTotal = contentRange?.substringAfterLast("/")?.trim()?.toLongOrNull()
-                    if (probedTotal != null && probedTotal > 0L) {
-                        totalBytes = probedTotal
-                    }
-                }
-            } catch (e: Exception) {
-                DiagnosticLogger.d("Downloader", "فحص حجم الفيديو: ${e.message}")
-            }
-        }
-
-        if (totalBytes <= 0L) {
-            totalBytes = 20 * 1024 * 1024L // 20MB fallback
-        }
-
-        db.downloadDao().updateStatus(entity.id, "DOWNLOADING", null)
         var downloadedBytes = if (resume && targetFile.exists()) targetFile.length() else 0L
         if (!resume && targetFile.exists()) {
             targetFile.delete()
             downloadedBytes = 0L
         }
-        db.downloadDao().updateProgress(entity.id, downloadedBytes, totalBytes, 0L)
 
-        val chunkSize = (if (speedBoosterEnabled) 2 * 1024 * 1024L else 1024 * 1024L) // 1MB - 2MB chunk size
-        val raf = RandomAccessFile(targetFile, "rw")
-        raf.seek(downloadedBytes)
+        var totalBytes = entity.totalBytes.takeIf { it > 0L }
+            ?: runCatching { Uri.parse(currentUrl).getQueryParameter("clen")?.toLongOrNull() }.getOrNull()
+            ?: 0L
 
-        var lastNotificationAt = 0L
-        var lastSpeedCheckTime = System.currentTimeMillis()
-        var bytesSinceLastCheck = 0L
-        var currentSpeed = 0L
+        db.downloadDao().updateStatus(entity.id, "DOWNLOADING", null)
+        db.downloadDao().updateProgress(entity.id, downloadedBytes, totalBytes.coerceAtLeast(15 * 1024 * 1024L), 0L)
 
-        try {
-            while (isActive && downloadedBytes < totalBytes) {
-                val chunkEnd = minOf(downloadedBytes + chunkSize - 1, totalBytes - 1)
-                val chunkUrl = if (cleanBaseUrl.contains("?")) {
-                    "$cleanBaseUrl&range=$downloadedBytes-$chunkEnd"
-                } else {
-                    "$cleanBaseUrl?range=$downloadedBytes-$chunkEnd"
+        val isAudio = entity.mimeType.contains("audio") || entity.quality.contains("صوت")
+
+        // Helper function to attempt streaming from a given URL
+        suspend fun tryStreamUrl(urlToTry: String): Boolean {
+            var raf: RandomAccessFile? = null
+            try {
+                val reqBuilder = Request.Builder()
+                    .url(urlToTry)
+                    .header("User-Agent", webUserAgent)
+                    .header("Accept", "*/*")
+                    .header("Connection", "keep-alive")
+
+                if (!urlToTry.contains("flokinet") && !urlToTry.contains("invidious")) {
+                    reqBuilder.header("Referer", referer)
+                    reqBuilder.header("Origin", "https://www.youtube.com")
+                    if (cookies.isNotBlank()) reqBuilder.header("Cookie", cookies)
                 }
 
-                var chunkSuccess = false
-                var retryCount = 0
+                if (downloadedBytes > 0) {
+                    reqBuilder.header("Range", "bytes=$downloadedBytes-")
+                }
 
-                while (!chunkSuccess && retryCount < 4 && isActive) {
-                    try {
-                        val req = Request.Builder()
-                            .url(chunkUrl)
-                            .header("User-Agent", webUserAgent)
-                            .header("Referer", referer)
-                            .header("Origin", "https://www.youtube.com")
-                            .header("Range", "bytes=$downloadedBytes-$chunkEnd")
-                            .apply { if (cookies.isNotBlank()) header("Cookie", cookies) }
-                            .build()
+                val resp = okHttpClient.newCall(reqBuilder.build()).execute()
+                if (!resp.isSuccessful && resp.code != 206) {
+                    resp.close()
+                    return false
+                }
 
-                        okHttpClient.newCall(req).execute().use { resp ->
-                            if (resp.isSuccessful || resp.code == 206) {
-                                val bodyStream = resp.body?.byteStream()
-                                if (bodyStream != null) {
-                                    val buf = ByteArray(32 * 1024)
-                                    var readBytes: Int
-                                    while (bodyStream.read(buf).also { readBytes = it } != -1) {
-                                        if (!isActive) break
-                                        raf.write(buf, 0, readBytes)
-                                        downloadedBytes += readBytes
-                                        bytesSinceLastCheck += readBytes
+                val body = resp.body ?: return false
+                val contentLen = body.contentLength()
+                if (contentLen > 0) {
+                    totalBytes = if (resp.code == 206) downloadedBytes + contentLen else contentLen
+                } else if (totalBytes <= 0L) {
+                    totalBytes = 20 * 1024 * 1024L
+                }
 
-                                        val now = System.currentTimeMillis()
-                                        val elapsed = now - lastSpeedCheckTime
-                                        if (elapsed >= 300) {
-                                            currentSpeed = if (elapsed > 0) (bytesSinceLastCheck * 1000) / elapsed else 0L
-                                            lastSpeedCheckTime = now
-                                            bytesSinceLastCheck = 0L
+                raf = RandomAccessFile(targetFile, "rw")
+                raf.seek(downloadedBytes)
 
-                                            db.downloadDao().updateProgress(entity.id, downloadedBytes, totalBytes, currentSpeed)
-                                            if (now - lastNotificationAt >= 800L) {
-                                                postDownloadNotification(context, entity, downloadedBytes, totalBytes, "جارٍ التنزيل", ongoing = true, speedBytes = currentSpeed)
-                                                lastNotificationAt = now
-                                            }
-                                        }
-                                    }
-                                    chunkSuccess = true
-                                }
-                            } else {
-                                retryCount++
-                                delay(600L * retryCount)
-                            }
+                val inputStream = body.byteStream()
+                val bufferSize = if (speedBoosterEnabled) 64 * 1024 else 32 * 1024
+                val buffer = ByteArray(bufferSize)
+                var bytesRead: Int
+                var lastSpeedCheckTime = System.currentTimeMillis()
+                var bytesSinceLastCheck = 0L
+                var currentSpeed = 0L
+                var lastNotificationAt = 0L
+
+                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                    if (!isActive) break
+                    raf.write(buffer, 0, bytesRead)
+                    downloadedBytes += bytesRead
+                    bytesSinceLastCheck += bytesRead
+
+                    val now = System.currentTimeMillis()
+                    val elapsed = now - lastSpeedCheckTime
+                    if (elapsed >= 300 || bytesSinceLastCheck >= 128 * 1024) {
+                        currentSpeed = if (elapsed > 0) (bytesSinceLastCheck * 1000) / elapsed else 0L
+                        lastSpeedCheckTime = now
+                        bytesSinceLastCheck = 0L
+
+                        db.downloadDao().updateProgress(entity.id, downloadedBytes, totalBytes, currentSpeed)
+                        if (now - lastNotificationAt >= 800L) {
+                            postDownloadNotification(
+                                context,
+                                entity,
+                                downloadedBytes,
+                                totalBytes,
+                                "جارٍ التنزيل",
+                                ongoing = true,
+                                speedBytes = currentSpeed
+                            )
+                            lastNotificationAt = now
                         }
-                    } catch (e: Exception) {
-                        retryCount++
-                        delay(600L * retryCount)
                     }
                 }
 
-                if (!chunkSuccess) {
-                    throw IllegalStateException("تعذر تنزيل جزء من مقطع الفيديو بعد عدة محاولات.")
-                }
+                raf.close()
+                raf = null
+                resp.close()
+                return downloadedBytes >= (if (totalBytes > 0) (totalBytes * 0.95).toLong() else 100 * 1024L)
+            } catch (e: Exception) {
+                DiagnosticLogger.d("Downloader", "خطأ أثناء الدفق من الرابط: ${e.message}")
+                return false
+            } finally {
+                runCatching { raf?.close() }
             }
-
-            raf.close()
-
-            if (downloadedBytes < 15 * 1024) {
-                targetFile.delete()
-                throw IllegalStateException("حجم الملف المستلم صغير جداً ($downloadedBytes بايت).")
-            }
-
-            // Publish file
-            MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), arrayOf(entity.mimeType), null)
-            val visiblePath = if (entity.destinationType == StorageDestination.PUBLIC_DOWNLOADS.name) {
-                publishToPublicDownloads(context, targetFile, entity.fileName, entity.mimeType) ?: targetFile.absolutePath
-            } else targetFile.absolutePath
-
-            db.downloadDao().insertOrUpdate(
-                entity.copy(
-                    localPath = visiblePath,
-                    downloadedBytes = downloadedBytes,
-                    totalBytes = downloadedBytes,
-                    status = "COMPLETED",
-                    speedBytesPerSec = 0L,
-                    completedAt = System.currentTimeMillis(),
-                    errorReason = null
-                )
-            )
-            postDownloadNotification(context, entity, downloadedBytes, downloadedBytes, "اكتمل التنزيل", ongoing = false)
-            DiagnosticLogger.s("Downloader", "اكتمل تنزيل يوتيوب بنجاح: '${entity.title}' (${MediaSniffer.formatFileSize(downloadedBytes)})")
-
-        } finally {
-            runCatching { raf.close() }
         }
+
+        // 1. Try initial stream URL
+        var success = tryStreamUrl(currentUrl)
+
+        // 2. If failed, auto-resolve fresh direct reverse proxy stream via YouTubeExtractor
+        if (!success && isActive && videoId != null) {
+            DiagnosticLogger.i("Downloader", "تجديد رابط البث تلقائياً عبر المحلل الموزع...")
+            val resolved = YouTubeExtractor.resolveDirectStream(videoId, isAudio)
+            if (resolved != null && resolved.url.isNotBlank()) {
+                currentUrl = resolved.url
+                success = tryStreamUrl(currentUrl)
+            }
+        }
+
+        if (!success || downloadedBytes < 15 * 1024) {
+            targetFile.delete()
+            throw IllegalStateException("تعذر إكمال تنزيل الفيديو بعد المحاولة من جميع المنافذ.")
+        }
+
+        // Publish file
+        try {
+            MediaScannerConnection.scanFile(
+                context,
+                arrayOf(targetFile.absolutePath),
+                arrayOf(entity.mimeType),
+                null
+            )
+        } catch (_: Exception) {}
+
+        val visiblePath = if (entity.destinationType == StorageDestination.PUBLIC_DOWNLOADS.name) {
+            publishToPublicDownloads(context, targetFile, entity.fileName, entity.mimeType) ?: targetFile.absolutePath
+        } else targetFile.absolutePath
+
+        val visibleSubtitlePath = entity.subtitlePath?.let { subtitlePath ->
+            val subtitleFile = File(subtitlePath)
+            if (entity.destinationType == StorageDestination.PUBLIC_DOWNLOADS.name && subtitleFile.exists()) {
+                publishToPublicDownloads(context, subtitleFile, subtitleFile.name, "text/vtt") ?: subtitlePath
+            } else subtitlePath
+        }
+
+        db.downloadDao().insertOrUpdate(
+            entity.copy(
+                localPath = visiblePath,
+                subtitlePath = visibleSubtitlePath,
+                downloadedBytes = downloadedBytes,
+                totalBytes = downloadedBytes,
+                status = "COMPLETED",
+                speedBytesPerSec = 0L,
+                completedAt = System.currentTimeMillis(),
+                errorReason = null
+            )
+        )
+        postDownloadNotification(context, entity, downloadedBytes, downloadedBytes, "اكتمل التنزيل", ongoing = false)
+        DiagnosticLogger.s("Downloader", "اكتمل تنزيل يوتيوب بنجاح: '${entity.title}' (${MediaSniffer.formatFileSize(downloadedBytes)})")
     }
 
     private fun resolveUrl(baseUrl: String, relativeUrl: String): String {
@@ -964,7 +968,12 @@ object DownloadManager {
 
     private suspend fun downloadSubtitleTrack(subUrl: String, localPath: String) = withContext(Dispatchers.IO) {
         try {
-            val req = Request.Builder().url(subUrl).build()
+            val fullSubUrl = when {
+                subUrl.startsWith("http://") || subUrl.startsWith("https://") -> subUrl
+                subUrl.startsWith("/") -> "https://www.youtube.com$subUrl"
+                else -> "https://www.youtube.com/$subUrl"
+            }
+            val req = Request.Builder().url(fullSubUrl).build()
             val resp = okHttpClient.newCall(req).execute()
             if (resp.isSuccessful) {
                 resp.body?.byteStream()?.use { input ->

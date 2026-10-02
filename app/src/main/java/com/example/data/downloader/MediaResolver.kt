@@ -42,14 +42,16 @@ object MediaResolver {
     suspend fun resolveDirectDownloadStream(source: String, isAudio: Boolean = false): ResolvedStream? =
         withContext(Dispatchers.IO) {
             val value = source.trim()
+            val ytId = YouTubeExtractor.extractVideoId(value)
+            if (ytId != null || (!value.startsWith("https://", true) && !value.startsWith("http://", true) && value.length in 10..12)) {
+                val targetId = ytId ?: value
+                DiagnosticLogger.i("MediaResolver", "تحويل رابط/معرف يوتيوب إلى المحلل المتقدم: $targetId")
+                return@withContext YouTubeExtractor.resolveDirectStream(targetId, isAudio)
+            }
+
             if (!value.startsWith("https://", true) && !value.startsWith("http://", true)) {
                 DiagnosticLogger.w("MediaResolver", "الرابط ليس HTTP(S): $value")
                 return@withContext null
-            }
-
-            if (YouTubeExtractor.isYouTubeUrl(value)) {
-                DiagnosticLogger.i("MediaResolver", "تحويل رابط يوتيوب إلى المحلل المتقدم: $value")
-                return@withContext YouTubeExtractor.resolveDirectStream(value, isAudio)
             }
 
             // 1. Try resolving via the high-availability Render Backend API

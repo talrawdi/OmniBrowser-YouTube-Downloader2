@@ -134,33 +134,33 @@ object YouTubeExtractor {
             }
         }
 
-        // Strategy 1: ANDROID_VR Innertube (Returns direct un-throttled progressive MP4s)
+        // Strategy 1: High-Speed Direct Proxy Invidious Network (Instant working MP4 streams)
+        extractViaInvidiousFallback(videoId)?.let {
+            if (it.streams.isNotEmpty()) return@withContext it
+        }
+
+        // Strategy 2: ANDROID_VR Innertube (Returns direct un-throttled progressive MP4s)
         extractViaInnertube(videoId, "ANDROID_VR")?.let {
             if (it.streams.isNotEmpty()) return@withContext it
         }
 
-        // Strategy 2: IOS Innertube
+        // Strategy 3: IOS Innertube
         extractViaInnertube(videoId, "IOS")?.let {
             if (it.streams.isNotEmpty()) return@withContext it
         }
 
-        // Strategy 3: TV Embedded Innertube
+        // Strategy 4: TV Embedded Innertube
         extractViaInnertube(videoId, "TVHTML5")?.let {
             if (it.streams.isNotEmpty()) return@withContext it
         }
 
-        // Strategy 4: Standard ANDROID Innertube
+        // Strategy 5: Standard ANDROID Innertube
         extractViaInnertube(videoId, "ANDROID")?.let {
             if (it.streams.isNotEmpty()) return@withContext it
         }
 
-        // Strategy 5: Web page HTML initial player response parsing
+        // Strategy 6: Web page HTML initial player response parsing
         extractViaWebPage(videoId)?.let {
-            if (it.streams.isNotEmpty()) return@withContext it
-        }
-
-        // Strategy 6: Decentralized Invidious public instance fallback
-        extractViaInvidiousFallback(videoId)?.let {
             if (it.streams.isNotEmpty()) return@withContext it
         }
 
@@ -752,10 +752,11 @@ object YouTubeExtractor {
     }
 
     /**
-     * Fallback strategy: Decentralized Invidious public instance query.
+     * Fallback strategy: Decentralized Invidious public instance query with reverse proxy streaming.
      */
     private suspend fun extractViaInvidiousFallback(videoId: String): YouTubeVideoInfo? {
         val instances = listOf(
+            "https://invidious.flokinet.to",
             "https://inv.nadeko.net",
             "https://invidious.nerdvpn.de",
             "https://invidious.jing.rocks",
@@ -788,10 +789,18 @@ object YouTubeExtractor {
                         val size = f.optLong("size", 0L)
                         val mime = f.optString("type", "video/mp4").substringBefore(';')
                         if (sUrl.isNotBlank()) {
+                            // Route through Invidious reverse proxy to bypass IP binding restrictions
+                            val proxyUrl = if (sUrl.contains("googlevideo.com")) {
+                                runCatching {
+                                    val parsed = Uri.parse(sUrl)
+                                    "$host${parsed.path}?${parsed.query}"
+                                }.getOrDefault(sUrl)
+                            } else sUrl
+
                             streams.add(
                                 YouTubeStream(
                                     quality = "$resolution HD (MP4 مباشر)",
-                                    url = sUrl,
+                                    url = proxyUrl,
                                     mimeType = mime,
                                     sizeBytes = size,
                                     isAudioOnly = false,
@@ -810,10 +819,17 @@ object YouTubeExtractor {
                         val isAudio = mime.startsWith("audio")
                         val sUrl = f.optString("url")
                         if (isAudio && sUrl.isNotBlank() && !streams.any { it.isAudioOnly }) {
+                            val proxyUrl = if (sUrl.contains("googlevideo.com")) {
+                                runCatching {
+                                    val parsed = Uri.parse(sUrl)
+                                    "$host${parsed.path}?${parsed.query}"
+                                }.getOrDefault(sUrl)
+                            } else sUrl
+
                             streams.add(
                                 YouTubeStream(
                                     quality = "صوت فقط عالي النقاء MP3/M4A",
-                                    url = sUrl,
+                                    url = proxyUrl,
                                     mimeType = "audio/mp4",
                                     sizeBytes = f.optLong("clen", 0L),
                                     isAudioOnly = true,
@@ -825,7 +841,7 @@ object YouTubeExtractor {
                 }
 
                 if (streams.isNotEmpty()) {
-                    DiagnosticLogger.s("YouTubeExtractor", "تم استخراج ($title) عبر المنفذ الاحتياطي الموزع بنجاح")
+                    DiagnosticLogger.s("YouTubeExtractor", "تم استخراج ($title) عبر المنفذ الاحتياطي الموزع بنجاح ($host)")
                     return YouTubeVideoInfo(
                         videoId = videoId,
                         title = title,
