@@ -282,6 +282,14 @@ object DownloadManager {
                     return@launch
                 }
 
+                // If URL is a YouTube / GoogleVideo stream, use dedicated Chunked YouTube Downloader
+                val isYouTube = entity.url.contains("googlevideo.com") || entity.url.contains("youtube.com") ||
+                               (entity.pageUrl?.contains("youtube.com") == true)
+                if (isYouTube) {
+                    downloadYouTubeChunkedStream(context, entity, targetFile, db, resume)
+                    return@launch
+                }
+
                 var currentDownloadUrl = MediaSniffer.cleanRangeParams(entity.url)
                 val videoId = MediaSniffer.extractYouTubeVideoId(entity.pageUrl ?: entity.url)
 
@@ -742,6 +750,188 @@ object DownloadManager {
             )
             postDownloadNotification(context, entity, totalDownloadedBytes, totalDownloadedBytes, "اكتمل التنزيل", ongoing = false)
             DiagnosticLogger.s("Downloader", "اكتمل تنزيل ودمج أجزاء الفيديو بنجاح (${MediaSniffer.formatFileSize(totalDownloadedBytes)})")
+        }
+    }
+
+    /**
+     * Dedicated YouTube & GoogleVideo Chunked Stream Downloader.
+     * Uses consecutive Range requests with full session headers & cookies
+     * to safely and reliably stream high-speed un-throttled MP4 data without IP binding or 403 errors.
+     */
+    private suspend fun downloadYouTubeChunkedStream(
+        context: Context,
+        entity: DownloadEntity,
+        targetFile: File,
+        db: AppDatabase,
+        resume: Boolean
+    ) = withContext(Dispatchers.IO) {
+        DiagnosticLogger.i("Downloader", "بدء تنزيل مقطع يوتيوب عبر تقنية الأجزاء المباشرة المتتالية (Chunked Range Engine)...")
+        val currentUrl = entity.url
+
+        val savedHeaders = MediaSniffer.capturedHeaders[currentUrl]
+            ?: MediaSniffer.capturedHeaders[MediaSniffer.cleanRangeParams(currentUrl)]
+            ?: emptyMap()
+
+        val webUserAgent = savedHeaders["User-Agent"]
+            ?: "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+
+        val referer = entity.pageUrl ?: "https://www.youtube.com/"
+        val cookies = runCatching {
+            CookieManager.getInstance().getCookie("https://www.youtube.com")
+        }.getOrNull().orEmpty()
+
+        // 1. Determine Total Bytes:
+        var totalBytes = runCatching { Uri.parse(currentUrl).getQueryParameter("clen")?.toLongOrNull() }.getOrNull() ?: 0L
+        if (totalBytes <= 0L && entity.totalBytes > 0L) {
+            totalBytes = entity.totalBytes
+        }
+
+        // Clean url base (strip existing range param so we can supply our own range parameters)
+        val cleanBaseUrl = currentUrl.replace(Regex("&range=[0-9]+-[0-9]+"), "")
+            .replace(Regex("\\?range=[0-9]+-[0-9]+&"), "?")
+            .replace(Regex("\\?range=[0-9]+-[0-9]+$"), "")
+
+        // If totalBytes is still unknown, probe with a tiny 0-1 range probe
+        if (totalBytes <= 0L) {
+            try {
+                val probeReq = Request.Builder()
+                    .url(if (cleanBaseUrl.contains("?")) "$cleanBaseUrl&range=0-1" else "$cleanBaseUrl?range=0-1")
+                    .header("User-Agent", webUserAgent)
+                    .header("Referer", referer)
+                    .header("Origin", "https://www.youtube.com")
+                    .apply { if (cookies.isNotBlank()) header("Cookie", cookies) }
+                    .header("Range", "bytes=0-1")
+                    .build()
+
+                okHttpClient.newCall(probeReq).execute().use { resp ->
+                    val contentRange = resp.header("Content-Range")
+                    val probedTotal = contentRange?.substringAfterLast("/")?.trim()?.toLongOrNull()
+                    if (probedTotal != null && probedTotal > 0L) {
+                        totalBytes = probedTotal
+                    }
+                }
+            } catch (e: Exception) {
+                DiagnosticLogger.d("Downloader", "فحص حجم الفيديو: ${e.message}")
+            }
+        }
+
+        if (totalBytes <= 0L) {
+            totalBytes = 20 * 1024 * 1024L // 20MB fallback
+        }
+
+        db.downloadDao().updateStatus(entity.id, "DOWNLOADING", null)
+        var downloadedBytes = if (resume && targetFile.exists()) targetFile.length() else 0L
+        if (!resume && targetFile.exists()) {
+            targetFile.delete()
+            downloadedBytes = 0L
+        }
+        db.downloadDao().updateProgress(entity.id, downloadedBytes, totalBytes, 0L)
+
+        val chunkSize = (if (speedBoosterEnabled) 2 * 1024 * 1024L else 1024 * 1024L) // 1MB - 2MB chunk size
+        val raf = RandomAccessFile(targetFile, "rw")
+        raf.seek(downloadedBytes)
+
+        var lastNotificationAt = 0L
+        var lastSpeedCheckTime = System.currentTimeMillis()
+        var bytesSinceLastCheck = 0L
+        var currentSpeed = 0L
+
+        try {
+            while (isActive && downloadedBytes < totalBytes) {
+                val chunkEnd = minOf(downloadedBytes + chunkSize - 1, totalBytes - 1)
+                val chunkUrl = if (cleanBaseUrl.contains("?")) {
+                    "$cleanBaseUrl&range=$downloadedBytes-$chunkEnd"
+                } else {
+                    "$cleanBaseUrl?range=$downloadedBytes-$chunkEnd"
+                }
+
+                var chunkSuccess = false
+                var retryCount = 0
+
+                while (!chunkSuccess && retryCount < 4 && isActive) {
+                    try {
+                        val req = Request.Builder()
+                            .url(chunkUrl)
+                            .header("User-Agent", webUserAgent)
+                            .header("Referer", referer)
+                            .header("Origin", "https://www.youtube.com")
+                            .header("Range", "bytes=$downloadedBytes-$chunkEnd")
+                            .apply { if (cookies.isNotBlank()) header("Cookie", cookies) }
+                            .build()
+
+                        okHttpClient.newCall(req).execute().use { resp ->
+                            if (resp.isSuccessful || resp.code == 206) {
+                                val bodyStream = resp.body?.byteStream()
+                                if (bodyStream != null) {
+                                    val buf = ByteArray(32 * 1024)
+                                    var readBytes: Int
+                                    while (bodyStream.read(buf).also { readBytes = it } != -1) {
+                                        if (!isActive) break
+                                        raf.write(buf, 0, readBytes)
+                                        downloadedBytes += readBytes
+                                        bytesSinceLastCheck += readBytes
+
+                                        val now = System.currentTimeMillis()
+                                        val elapsed = now - lastSpeedCheckTime
+                                        if (elapsed >= 300) {
+                                            currentSpeed = if (elapsed > 0) (bytesSinceLastCheck * 1000) / elapsed else 0L
+                                            lastSpeedCheckTime = now
+                                            bytesSinceLastCheck = 0L
+
+                                            db.downloadDao().updateProgress(entity.id, downloadedBytes, totalBytes, currentSpeed)
+                                            if (now - lastNotificationAt >= 800L) {
+                                                postDownloadNotification(context, entity, downloadedBytes, totalBytes, "جارٍ التنزيل", ongoing = true, speedBytes = currentSpeed)
+                                                lastNotificationAt = now
+                                            }
+                                        }
+                                    }
+                                    chunkSuccess = true
+                                }
+                            } else {
+                                retryCount++
+                                delay(600L * retryCount)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        retryCount++
+                        delay(600L * retryCount)
+                    }
+                }
+
+                if (!chunkSuccess) {
+                    throw IllegalStateException("تعذر تنزيل جزء من مقطع الفيديو بعد عدة محاولات.")
+                }
+            }
+
+            raf.close()
+
+            if (downloadedBytes < 15 * 1024) {
+                targetFile.delete()
+                throw IllegalStateException("حجم الملف المستلم صغير جداً ($downloadedBytes بايت).")
+            }
+
+            // Publish file
+            MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), arrayOf(entity.mimeType), null)
+            val visiblePath = if (entity.destinationType == StorageDestination.PUBLIC_DOWNLOADS.name) {
+                publishToPublicDownloads(context, targetFile, entity.fileName, entity.mimeType) ?: targetFile.absolutePath
+            } else targetFile.absolutePath
+
+            db.downloadDao().insertOrUpdate(
+                entity.copy(
+                    localPath = visiblePath,
+                    downloadedBytes = downloadedBytes,
+                    totalBytes = downloadedBytes,
+                    status = "COMPLETED",
+                    speedBytesPerSec = 0L,
+                    completedAt = System.currentTimeMillis(),
+                    errorReason = null
+                )
+            )
+            postDownloadNotification(context, entity, downloadedBytes, downloadedBytes, "اكتمل التنزيل", ongoing = false)
+            DiagnosticLogger.s("Downloader", "اكتمل تنزيل يوتيوب بنجاح: '${entity.title}' (${MediaSniffer.formatFileSize(downloadedBytes)})")
+
+        } finally {
+            runCatching { raf.close() }
         }
     }
 

@@ -1091,11 +1091,21 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
 
                                         // 2. Video Sniffer interceptor
                                         if (MediaSniffer.isMediaResource(reqUrl)) {
+                                            val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                                            val currentCookies = CookieManager.getInstance().getCookie(reqUrl)
+                                                ?: CookieManager.getInstance().getCookie(activeTab?.url ?: "https://www.youtube.com")
+                                            if (!currentCookies.isNullOrBlank()) {
+                                                reqHeaders["Cookie"] = currentCookies
+                                            }
+                                            val currentReferer = activeTab?.url
+                                            if (!reqHeaders.containsKey("Referer") && !currentReferer.isNullOrBlank()) {
+                                                reqHeaders["Referer"] = currentReferer
+                                            }
                                             MediaSniffer.onMediaUrlIntercepted(
                                                 url = reqUrl,
                                                 pageUrl = activeTab?.url ?: "",
                                                 pageTitle = activeTab?.title ?: "فيديو مباشر",
-                                                headers = request.requestHeaders ?: emptyMap()
+                                                headers = reqHeaders
                                             )
                                         }
 

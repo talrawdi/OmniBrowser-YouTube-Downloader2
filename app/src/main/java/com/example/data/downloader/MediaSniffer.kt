@@ -714,6 +714,7 @@ object MediaSniffer {
 
         if (headers.isNotEmpty()) {
             capturedHeaders[cleanUrl] = headers
+            capturedHeaders[url] = headers
         }
 
         // Ignore small ad beacons & tracking analytics
