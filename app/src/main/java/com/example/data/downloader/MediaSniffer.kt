@@ -436,10 +436,12 @@ object MediaSniffer {
                             val cleanUrl = cleanRangeParams(streamUrl)
                             val rawContentLength = f.optString("contentLength")
                             val parsedSize = rawContentLength.toLongOrNull() ?: f.optLong("contentLength", 0L)
+                            val urlContentLength = Uri.parse(cleanUrl).getQueryParameter("clen")?.toLongOrNull() ?: 0L
                             val bitrate = f.optString("bitrate").toLongOrNull() ?: f.optLong("bitrate", 0L)
 
                             val finalSize = when {
                                 parsedSize > 0L -> parsedSize
+                                urlContentLength > 0L -> urlContentLength
                                 bitrate > 0L && durationSeconds > 0L -> (bitrate * durationSeconds) / 8
                                 else -> calculateEstimatedSize(f.optInt("height", 720), durationSeconds, isAudio = false)
                             }
@@ -451,7 +453,7 @@ object MediaSniffer {
                                     url = cleanUrl,
                                     sizeBytes = finalSize,
                                     mimeType = mime,
-                                    isEstimatedSize = (parsedSize == 0L)
+                                    isEstimatedSize = (parsedSize == 0L && urlContentLength == 0L)
                                 )
                             )
                         }
@@ -474,11 +476,13 @@ object MediaSniffer {
                             val cleanUrl = cleanRangeParams(streamUrl)
                             val rawContentLength = f.optString("contentLength")
                             val parsedSize = rawContentLength.toLongOrNull() ?: f.optLong("contentLength", 0L)
+                            val urlContentLength = Uri.parse(cleanUrl).getQueryParameter("clen")?.toLongOrNull() ?: 0L
                             val bitrate = f.optString("bitrate").toLongOrNull() ?: f.optLong("bitrate", 0L)
                             val qualityLabel = f.optString("qualityLabel")
 
                             val finalSize = when {
                                 parsedSize > 0L -> parsedSize
+                                urlContentLength > 0L -> urlContentLength
                                 bitrate > 0L && durationSeconds > 0L -> (bitrate * durationSeconds) / 8
                                 else -> calculateEstimatedSize(f.optInt("height", 0), durationSeconds, isAudio = isAudio)
                             }
@@ -491,7 +495,7 @@ object MediaSniffer {
                                         sizeBytes = finalSize,
                                         isAudioOnly = true,
                                         mimeType = "audio/mp4",
-                                        isEstimatedSize = (parsedSize == 0L)
+                                        isEstimatedSize = (parsedSize == 0L && urlContentLength == 0L)
                                     )
                                 )
                             } else if (!isAudio && qualityLabel.contains("1080p") && !qualitiesList.any { it.label.contains("1080p") }) {
@@ -501,7 +505,7 @@ object MediaSniffer {
                                         url = cleanUrl,
                                         sizeBytes = finalSize,
                                         mimeType = mime,
-                                        isEstimatedSize = (parsedSize == 0L)
+                                        isEstimatedSize = (parsedSize == 0L && urlContentLength == 0L)
                                     )
                                 )
                             } else if (!isAudio && qualityLabel.contains("480p") && !qualitiesList.any { it.label.contains("480p") }) {
@@ -511,7 +515,7 @@ object MediaSniffer {
                                         url = cleanUrl,
                                         sizeBytes = finalSize,
                                         mimeType = mime,
-                                        isEstimatedSize = (parsedSize == 0L)
+                                        isEstimatedSize = (parsedSize == 0L && urlContentLength == 0L)
                                     )
                                 )
                             }
@@ -649,16 +653,21 @@ object MediaSniffer {
                     val isAudio = obj.optBoolean("isAudio", false)
                     val mime = obj.optString("mimeType", if (isAudio) "audio/mp4" else "video/mp4")
 
-                    if (size == 0L) {
+                    val urlContentLength = Uri.parse(url).getQueryParameter("clen")?.toLongOrNull() ?: 0L
+                    if (size == 0L && urlContentLength > 0L) {
+                        size = urlContentLength
+                    } else if (size == 0L) {
                         size = calculateEstimatedSize(if (q.contains("1080")) 1080 else if (q.contains("480")) 480 else 720, duration, isAudio)
                     }
 
                     if (url.isNotBlank()) {
-                        capturedHeaders[url] = mapOf(
+                        val headers = mapOf(
                             "User-Agent" to "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36",
                             "Referer" to pageUrl
                         )
-                        qualities.add(SniffedQuality(q, url, size, isAudio, mime, isEstimatedSize = (obj.optLong("contentLength", 0L) == 0L)))
+                        capturedHeaders[url] = headers
+                        capturedHeaders[rawUrl] = headers
+                        qualities.add(SniffedQuality(q, url, size, isAudio, mime, isEstimatedSize = (obj.optLong("contentLength", 0L) == 0L && urlContentLength == 0L)))
                     }
                 }
 

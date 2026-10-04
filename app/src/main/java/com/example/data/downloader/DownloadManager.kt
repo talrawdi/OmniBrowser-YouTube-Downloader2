@@ -359,12 +359,23 @@ object DownloadManager {
                 val contentLen = body.contentLength()
 
                 if (downloadedBytes > 0 && response.code == 200) {
+                    // The server ignored the resume Range request. Never append a full
+                    // response to an existing partial file; restart from byte zero.
                     downloadedBytes = 0L
+                    RandomAccessFile(targetFile, "rw").use { it.setLength(0L) }
                 }
 
-                val totalBytes = if (contentLen > 0) {
-                    if (response.code == 206) downloadedBytes + contentLen else contentLen
-                } else if (entity.totalBytes > 0) entity.totalBytes else 15 * 1024 * 1024L
+                val contentRangeTotal = response.header("Content-Range")
+                    ?.substringAfterLast('/')
+                    ?.toLongOrNull()
+                    ?: 0L
+                val totalBytes = when {
+                    contentRangeTotal > 0L -> contentRangeTotal
+                    contentLen > 0L && response.code == 206 -> downloadedBytes + contentLen
+                    contentLen > 0L -> contentLen
+                    entity.totalBytes > 0L -> entity.totalBytes
+                    else -> 0L
+                }
 
                 db.downloadDao().updateStatus(entity.id, "DOWNLOADING", null)
                 db.downloadDao().updateProgress(entity.id, downloadedBytes, totalBytes, 0L)
@@ -564,9 +575,9 @@ object DownloadManager {
                     if (merged.isNotBlank()) req.header("Cookie", merged)
                 } catch (_: Exception) {}
 
-                if (downloadedBytes > 0) {
-                    req.header("Range", "bytes=$downloadedBytes-")
-                }
+                // Send an explicit range even at byte zero. Some media CDNs return
+                // an error or a tiny manifest when the initial Range header is absent.
+                req.header("Range", "bytes=$downloadedBytes-")
 
                 val resp = okHttpClient.newCall(req.build()).execute()
                 if (resp.isSuccessful || resp.code == 206) {
@@ -793,7 +804,9 @@ object DownloadManager {
             ?: 0L
 
         db.downloadDao().updateStatus(entity.id, "DOWNLOADING", null)
-        db.downloadDao().updateProgress(entity.id, downloadedBytes, totalBytes.coerceAtLeast(15 * 1024 * 1024L), 0L)
+        // Keep an unknown size unknown; displaying a fabricated 15 MB total makes
+        // the UI look stuck and causes misleading progress reports.
+        db.downloadDao().updateProgress(entity.id, downloadedBytes, totalBytes, 0L)
 
         val isAudio = entity.mimeType.contains("audio") || entity.quality.contains("صوت")
 
@@ -813,9 +826,9 @@ object DownloadManager {
                     if (cookies.isNotBlank()) reqBuilder.header("Cookie", cookies)
                 }
 
-                if (downloadedBytes > 0) {
-                    reqBuilder.header("Range", "bytes=$downloadedBytes-")
-                }
+                // Always request the byte range, including the initial bytes=0-
+                // request. This makes the response semantics explicit.
+                reqBuilder.header("Range", "bytes=$downloadedBytes-")
 
                 val resp = okHttpClient.newCall(reqBuilder.build()).execute()
                 if (!resp.isSuccessful && resp.code != 206) {
@@ -824,11 +837,24 @@ object DownloadManager {
                 }
 
                 val body = resp.body ?: return false
+                if (downloadedBytes > 0L && resp.code == 200) {
+                    // A server that ignores Range must not be appended to a partial file.
+                    downloadedBytes = 0L
+                    RandomAccessFile(targetFile, "rw").use { it.setLength(0L) }
+                }
+                val contentRangeTotal = resp.header("Content-Range")
+                    ?.substringAfterLast('/')
+                    ?.toLongOrNull()
+                    ?: 0L
                 val contentLen = body.contentLength()
                 if (contentLen > 0) {
-                    totalBytes = if (resp.code == 206) downloadedBytes + contentLen else contentLen
-                } else if (totalBytes <= 0L) {
-                    totalBytes = 20 * 1024 * 1024L
+                    totalBytes = when {
+                        contentRangeTotal > 0L -> contentRangeTotal
+                        resp.code == 206 -> downloadedBytes + contentLen
+                        else -> contentLen
+                    }
+                } else if (contentRangeTotal > 0L) {
+                    totalBytes = contentRangeTotal
                 }
 
                 raf = RandomAccessFile(targetFile, "rw")

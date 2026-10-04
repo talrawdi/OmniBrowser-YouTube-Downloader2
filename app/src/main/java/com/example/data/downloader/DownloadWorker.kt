@@ -29,14 +29,16 @@ class DownloadWorker(
                 e
             )
             db.downloadDao().updateStatus(downloadId, "FAILED", e.localizedMessage ?: "تعذر بدء التنزيل")
-            return if (runAttemptCount < MAX_RETRIES) Result.retry() else Result.failure(workDataOf("error" to (e.localizedMessage ?: "فشل بدء التنزيل")))
+            // A failed download is surfaced to the user. Automatic retry here used
+            // to restart the same expired media URL repeatedly; the user can retry
+            // explicitly after a fresh URL is captured.
+            return Result.failure(workDataOf("error" to (e.localizedMessage ?: "فشل بدء التنزيل")))
         }
 
         val result = db.downloadDao().getDownloadById(downloadId)
         return when {
             result?.status == "COMPLETED" -> Result.success()
             result?.status == "PAUSED" || result?.status == "CANCELLED" -> Result.failure()
-            runAttemptCount < MAX_RETRIES -> Result.retry()
             else -> Result.failure(workDataOf("error" to (result?.errorReason ?: "فشل التنزيل بعد عدة محاولات")))
         }
     }
