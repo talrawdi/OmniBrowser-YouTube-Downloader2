@@ -148,7 +148,7 @@ fun MediaItemCard(
             selectedQuality = availableQualities.firstOrNull() ?: selectedQuality
         }
     }
-    var downloadWithSubtitles by remember { mutableStateOf(media.subtitles.isNotEmpty()) }
+    var downloadWithSubtitles by remember { mutableStateOf(false) }
     var selectedDestination by remember { mutableStateOf(initialDestination) }
     var showQualityDropdown by remember { mutableStateOf(false) }
 
@@ -248,31 +248,7 @@ fun MediaItemCard(
                 }
             }
 
-            // Subtitle Option
-            if (media.subtitles.isNotEmpty()) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Checkbox(
-                        checked = downloadWithSubtitles,
-                        onCheckedChange = { downloadWithSubtitles = it }
-                    )
-                    Text(
-                        text = "تنزيل ملف الترجمة المرفق تلقائياً (${media.subtitles.size} لغة مكتشفة)",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-                OutlinedButton(
-                    onClick = { media.subtitles.firstOrNull()?.url?.let(onDownloadSubtitle) },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Icon(Icons.Default.Subtitles, contentDescription = null)
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("تنزيل الترجمة فقط")
-                }
-            }
-
+            // Subtitle download is intentionally disabled: video-only downloads are more reliable.
             // Destination Selector Choice
             Row(
                 modifier = Modifier

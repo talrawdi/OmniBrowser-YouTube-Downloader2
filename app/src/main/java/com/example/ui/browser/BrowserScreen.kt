@@ -1289,13 +1289,12 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
                 activePlayingIsPartial = false
             },
             onStartDownload = { media, quality, withSub, dest ->
-                val subUrl = if (withSub) media.subtitles.firstOrNull()?.url else null
                 DownloadManager.startDownload(
                     context = context,
                     url = quality.url,
                     title = media.title,
                     quality = quality.label,
-                    subtitleUrl = subUrl,
+                    subtitleUrl = null,
                     mimeType = if (quality.isAudioOnly) quality.mimeType else media.mimeType,
                     pageUrl = media.pageUrl.ifBlank { activeTab?.url },
                     destination = dest
