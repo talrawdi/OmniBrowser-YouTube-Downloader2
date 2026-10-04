@@ -154,6 +154,10 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
     val offlinePages by viewModel.offlinePages.collectAsState()
     val browsingStats by viewModel.browsingStats.collectAsState()
     val sniffedMedia by viewModel.sniffedMedia.collectAsState()
+    val currentPageMedia = remember(sniffedMedia, activeTab?.url) {
+        val pageUrl = activeTab?.url.orEmpty()
+        sniffedMedia.filter { MediaSniffer.mediaBelongsToPage(it, pageUrl) }
+    }
 
     val isAdBlock by viewModel.isAdBlockEnabled.collectAsState()
     val isDataSaver by viewModel.isDataSaverEnabled.collectAsState()
@@ -1225,7 +1229,7 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
             }
 
             // Floating Pulsing Video Sniffer Badge
-            if (sniffedMedia.isNotEmpty()) {
+            if (currentPageMedia.isNotEmpty()) {
                 ExtendedFloatingActionButton(
                     onClick = { showMediaSheet = true },
                     containerColor = MaterialTheme.colorScheme.primary,
@@ -1244,7 +1248,7 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
                     },
                     text = {
                         Text(
-                            text = if (sniffedMedia.size == 1) "تنزيل الفيديو" else "تنزيل (${sniffedMedia.size}) فيديوهات",
+                            text = if (currentPageMedia.size == 1) "تنزيل الفيديو" else "تنزيل (${currentPageMedia.size}) فيديوهات",
                             style = MaterialTheme.typography.labelLarge,
                             fontWeight = FontWeight.Bold
                         )
@@ -1271,7 +1275,7 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
     // Video Detection & Download Options Sheet
     if (showMediaSheet) {
         VideoDetectionDialog(
-            mediaList = sniffedMedia,
+            mediaList = currentPageMedia,
             currentDestination = downloadDest,
             onPlayOnline = { media, quality ->
                 showMediaSheet = false

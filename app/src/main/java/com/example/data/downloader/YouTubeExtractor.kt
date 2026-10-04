@@ -126,16 +126,18 @@ object YouTubeExtractor {
         val videoId = extractVideoId(videoIdOrUrl) ?: return@withContext null
         DiagnosticLogger.i("YouTubeExtractor", "بدء استخراج بيانات الفيديو ($videoId)...")
 
-        // Strategy 0: Custom High-Performance Render Backend API (https://omnibrowser-media-api.onrender.com)
-        extractViaRenderBackend(videoId, videoIdOrUrl)?.let {
+        // Strategy 0: the public Invidious route observed succeeding in the device
+        // logs. Trying it first removes the Render cold-start timeout from the
+        // normal path; Render remains available as a fallback below.
+        extractViaInvidiousFallback(videoId)?.let {
             if (it.streams.isNotEmpty()) {
-                DiagnosticLogger.i("YouTubeExtractor", "تم استخراج الروابط المباشرة عبر خادم Render بنجاح!")
+                DiagnosticLogger.i("YouTubeExtractor", "تم استخراج الروابط عبر المسار الناجح في السجل")
                 return@withContext it
             }
         }
 
-        // Strategy 1: High-Speed Direct Proxy Invidious Network (Instant working MP4 streams)
-        extractViaInvidiousFallback(videoId)?.let {
+        // Strategy 1: Custom Render backend, retained as a fallback.
+        extractViaRenderBackend(videoId, videoIdOrUrl)?.let {
             if (it.streams.isNotEmpty()) return@withContext it
         }
 

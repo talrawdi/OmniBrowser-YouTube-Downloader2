@@ -132,7 +132,22 @@ fun MediaItemCard(
     onDownload: (quality: SniffedQuality, withSubtitles: Boolean, destination: StorageDestination) -> Unit,
     onDownloadSubtitle: (subtitleUrl: String) -> Unit
 ) {
-    var selectedQuality by remember { mutableStateOf(media.qualities.firstOrNull() ?: SniffedQuality("720p HD", media.originalUrl)) }
+    val availableQualities = remember(media.qualities) {
+        media.qualities
+            .filter { it.url.isNotBlank() }
+            .distinctBy { "${it.label.trim().lowercase()}|${it.url}" }
+            .sortedWith(compareBy<SniffedQuality> { it.isAudioOnly }.thenByDescending {
+                Regex("(\\d{3,4})p").find(it.label)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+            })
+    }
+    var selectedQuality by remember(availableQualities) {
+        mutableStateOf(availableQualities.firstOrNull() ?: SniffedQuality("جودة متاحة", media.originalUrl))
+    }
+    LaunchedEffect(availableQualities) {
+        if (availableQualities.none { it.url == selectedQuality.url }) {
+            selectedQuality = availableQualities.firstOrNull() ?: selectedQuality
+        }
+    }
     var downloadWithSubtitles by remember { mutableStateOf(media.subtitles.isNotEmpty()) }
     var selectedDestination by remember { mutableStateOf(initialDestination) }
     var showQualityDropdown by remember { mutableStateOf(false) }
@@ -218,7 +233,7 @@ fun MediaItemCard(
                         expanded = showQualityDropdown,
                         onDismissRequest = { showQualityDropdown = false }
                     ) {
-                        media.qualities.forEach { quality ->
+                        availableQualities.forEach { quality ->
                             DropdownMenuItem(
                                 text = {
                                     Text("${quality.label} (${MediaSniffer.formatFileSize(quality.sizeBytes, quality.isEstimatedSize)})")
