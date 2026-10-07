@@ -853,7 +853,9 @@ object DownloadManager {
         val referer = savedHeaders["Referer"] ?: entity.pageUrl ?: "https://www.youtube.com/"
         val cookies = savedHeaders["Cookie"] ?: runCatching {
             CookieManager.getInstance().getCookie("https://www.youtube.com")
+                ?: CookieManager.getInstance().getCookie("https://m.youtube.com")
         }.getOrNull().orEmpty()
+        DiagnosticLogger.d("Downloader", "رؤوس تنزيل YouTube: UA=${webUserAgent.take(42)}..., Cookie=${if (cookies.isBlank()) "غير موجودة" else "موجودة"}, Referer=$referer")
 
         var downloadedBytes = if (resume && targetFile.exists()) targetFile.length() else 0L
         if (!resume && targetFile.exists()) {
@@ -896,6 +898,9 @@ object DownloadManager {
                 reqBuilder.header("Range", "bytes=$downloadedBytes-")
 
                 val resp = okHttpClient.newCall(reqBuilder.build()).execute()
+                val responseType = resp.header("Content-Type").orEmpty()
+                val responseLength = resp.header("Content-Length") ?: "غير محدد"
+                DiagnosticLogger.d("Downloader", "استجابة رابط YouTube: HTTP ${resp.code}, type=$responseType, length=$responseLength, range=${resp.header("Content-Range") ?: "غير محدد"}")
                 if (!resp.isSuccessful && resp.code != 206) {
                     resp.close()
                     return false

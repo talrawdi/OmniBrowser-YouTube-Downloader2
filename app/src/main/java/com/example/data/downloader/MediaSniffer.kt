@@ -176,6 +176,7 @@ object MediaSniffer {
                                             quality: f.qualityLabel || (f.height ? f.height + 'p' : ''),
                                             height: parseInt(f.height) || 0,
                                             url: fUrl,
+                                            cipher: (f.signatureCipher || f.cipher || ''),
                                             mimeType: f.mimeType || 'video/mp4',
                                             contentLength: cLen,
                                             isAudio: false
@@ -198,6 +199,7 @@ object MediaSniffer {
                                             quality: isAudio ? 'صوت فقط MP3/M4A (عالي النقاء)' : (f.qualityLabel || (f.height ? f.height + 'p' : '')),
                                             height: parseInt(f.height) || 0,
                                             url: fUrl,
+                                            cipher: (f.signatureCipher || f.cipher || ''),
                                             mimeType: f.mimeType || (isAudio ? 'audio/mp4' : 'video/mp4'),
                                             contentLength: cLen,
                                             isAudio: isAudio
@@ -381,10 +383,18 @@ object MediaSniffer {
                 for (i in 0 until formatsArray.length()) {
                     val obj = formatsArray.getJSONObject(i)
                     val rawUrl = obj.optString("url")
-                    val url = cleanRangeParams(rawUrl)
+                    val cipher = obj.optString("cipher")
+                    val resolvedUrl = if (cipher.isNotBlank()) {
+                        YouTubeExtractor.resolveCipherUrl(cipher) ?: rawUrl
+                    } else rawUrl
+                    val url = cleanRangeParams(resolvedUrl)
                     val isAudio = obj.optBoolean("isAudio", false)
                     val height = obj.optInt("height", 0)
                     if (!isAudio && height <= 0) continue
+                    if (url.isBlank()) {
+                        DiagnosticLogger.w("MediaSniffer", "تم تجاهل صيغة YouTube بلا رابط صالح بعد فك signatureCipher")
+                        continue
+                    }
                     val q = obj.optString("quality").ifBlank { "${height}p" }
                     var size = obj.optLong("contentLength", 0L)
                     val mime = obj.optString("mimeType", if (isAudio) "audio/mp4" else "video/mp4")

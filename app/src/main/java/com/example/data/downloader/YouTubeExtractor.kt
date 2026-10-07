@@ -480,6 +480,12 @@ object YouTubeExtractor {
         return null
     }
 
+    /** Resolves a complete signatureCipher captured by the WebView. */
+    suspend fun resolveCipherUrl(cipher: String): String? {
+        if (cipher.isBlank()) return null
+        return decipherSignatureLocally(cipher)
+    }
+
     /**
      * On-Device Signature Decipherer.
      * Deciphers encrypted YouTube signature parameter locally in Kotlin without any server.
@@ -492,6 +498,10 @@ object YouTubeExtractor {
             val sigParam = params["sp"] ?: "sig"
 
             val operations = getOrFetchDecipherOperations()
+            if (operations.isEmpty() && params["s"] != null) {
+                DiagnosticLogger.w("YouTubeExtractor", "تعذر تحميل عمليات فك توقيع YouTube محليًا")
+                return@withContext null
+            }
             val decipheredSig = if (operations.isNotEmpty()) {
                 applyDecipherOperations(signature, operations)
             } else {
