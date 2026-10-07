@@ -612,12 +612,7 @@ object YouTubeExtractor {
     private suspend fun extractViaRenderBackend(videoId: String, originalUrl: String): YouTubeVideoInfo? {
         val watchUrl = "https://www.youtube.com/watch?v=$videoId"
         val encodedUrl = runCatching { java.net.URLEncoder.encode(watchUrl, "UTF-8") }.getOrDefault(watchUrl)
-        val endpoints = listOf(
-            "$RENDER_BACKEND_URL/resolve?url=$encodedUrl",
-            "$RENDER_BACKEND_URL/extract?url=$encodedUrl",
-            "$RENDER_BACKEND_URL/api/info?url=$encodedUrl",
-            "$RENDER_BACKEND_URL/video?url=$encodedUrl"
-        )
+        val endpoints = listOf("$RENDER_BACKEND_URL/resolve?url=$encodedUrl")
 
         for (endpoint in endpoints) {
             try {
@@ -633,8 +628,8 @@ object YouTubeExtractor {
                         if (body.isNotBlank()) {
                             val json = JSONObject(body)
                             val title = json.optString("title", "فيديو يوتيوب")
-                            val duration = json.optLong("duration", 0L)
-                            val thumb = json.optString("thumbnail", "https://i.ytimg.com/vi/$videoId/hqdefault.jpg")
+                            val duration = json.optLong("duration_seconds", json.optLong("duration", 0L))
+                            val thumb = json.optString("thumbnail_url", json.optString("thumbnail", "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"))
 
                             val streamsList = mutableListOf<YouTubeStream>()
 
@@ -651,7 +646,7 @@ object YouTubeExtractor {
                                         quality = json.optString("quality", "720p HD (عبر السيرفر الخاص)"),
                                         url = directUrl,
                                         mimeType = json.optString("mime_type", "video/mp4"),
-                                        sizeBytes = json.optLong("size_bytes", 0L),
+                                        sizeBytes = json.optLong("filesize", json.optLong("size_bytes", 0L)),
                                         clientSource = "RENDER_BACKEND"
                                     )
                                 )
@@ -672,7 +667,7 @@ object YouTubeExtractor {
                                                 quality = f.optString("quality", if (isAud) "صوت MP3/M4A" else "دقة عالية HD"),
                                                 url = fUrl,
                                                 mimeType = f.optString("mime_type", if (isAud) "audio/mp4" else "video/mp4"),
-                                                sizeBytes = f.optLong("size_bytes", 0L),
+                                                sizeBytes = f.optLong("filesize", f.optLong("size_bytes", 0L)),
                                                 isAudioOnly = isAud,
                                                 clientSource = "RENDER_BACKEND"
                                             )
@@ -877,17 +872,8 @@ object YouTubeExtractor {
     }
 
     private fun calculateStreamSize(contentLength: Long, bitrate: Long, duration: Long, height: Int, isAudio: Boolean): Long {
-        if (contentLength > 0L) return contentLength
-        if (bitrate > 0L && duration > 0L) return (bitrate * duration) / 8L
-        val dur = if (duration > 0L) duration else 180L
-        val estBitrate = when {
-            isAudio -> 128_000L
-            height >= 1080 -> 3_500_000L
-            height >= 720 -> 1_500_000L
-            height >= 480 -> 750_000L
-            else -> 400_000L
-        }
-        return (estBitrate * dur) / 8L
+        // A bitrate estimate is not a file size. Only provider contentLength is valid.
+        return contentLength.takeIf { it > 0L } ?: 0L
     }
 
     private fun cleanRangeParams(url: String): String {

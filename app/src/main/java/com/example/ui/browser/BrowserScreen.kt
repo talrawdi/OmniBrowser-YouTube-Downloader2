@@ -849,8 +849,11 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
                                     // Do not surface stale offline error pages while a network is available.
                                     // Data saving is handled by media/image policies instead of forcing cache-only navigation.
                                     cacheMode = WebSettings.LOAD_DEFAULT
+                                    javaScriptCanOpenWindowsAutomatically = true
+                                    setSupportMultipleWindows(false)
                                 }
-
+                                // Google/YouTube authentication uses cross-site cookies in WebView.
+                                CookieManager.getInstance().setAcceptThirdPartyCookies(this, activeTab?.isIncognito != true)
                                 if (activeTab?.isIncognito == true) {
                                     settings.cacheMode = WebSettings.LOAD_NO_CACHE
                                     settings.saveFormData = false
