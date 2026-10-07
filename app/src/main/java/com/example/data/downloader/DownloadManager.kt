@@ -177,7 +177,9 @@ object DownloadManager {
             val effectiveEntity = entity.copy(
                 fileName = remoteName,
                 localPath = File(targetDir, remoteName).absolutePath,
-                subtitlePath = resolvedSubPath
+                // Subtitle downloads are explicit and separate from the video job.
+                subtitleUrl = null,
+                subtitlePath = null
             )
             db.downloadDao().insertOrUpdate(effectiveEntity)
             postDownloadNotification(appContext, effectiveEntity, 0L, 0L, "بدء التنزيل", ongoing = true)
@@ -868,14 +870,15 @@ object DownloadManager {
                     ?.toLongOrNull()
                     ?: 0L
                 val contentLen = body.contentLength()
-                if (contentLen > 0) {
-                    totalBytes = when {
-                        contentRangeTotal > 0L -> contentRangeTotal
-                        resp.code == 206 -> downloadedBytes + contentLen
-                        else -> contentLen
-                    }
-                } else if (contentRangeTotal > 0L) {
+                if (contentRangeTotal > 0L) {
                     totalBytes = contentRangeTotal
+                } else if (resp.code == 200 && contentLen > 0L) {
+                    totalBytes = contentLen
+                } else if (totalBytes <= 0L) {
+                    // A 206 response without Content-Range is only an unknown fragment.
+                    // Never promote it to a completed video.
+                    resp.close()
+                    return false
                 }
 
                 raf = RandomAccessFile(targetFile, "rw")
@@ -922,7 +925,7 @@ object DownloadManager {
                 raf.close()
                 raf = null
                 resp.close()
-                return downloadedBytes >= (if (totalBytes > 0) (totalBytes * 0.95).toLong() else 100 * 1024L)
+                return totalBytes > 0L && downloadedBytes >= totalBytes
             } catch (e: Exception) {
                 DiagnosticLogger.d("Downloader", "خطأ أثناء الدفق من الرابط: ${e.message}")
                 return false
@@ -989,6 +992,24 @@ object DownloadManager {
         )
         postDownloadNotification(context, entity, downloadedBytes, downloadedBytes, "اكتمل التنزيل", ongoing = false)
         DiagnosticLogger.s("Downloader", "اكتمل تنزيل يوتيوب بنجاح: '${entity.title}' (${MediaSniffer.formatFileSize(downloadedBytes)})")
+    }
+
+    private fun isValidMediaContainer(file: File, mimeType: String): Boolean {
+        if (!file.exists() || file.length() < 32L) return false
+        return try {
+            FileInputStream(file).use { input ->
+                val header = ByteArray(32)
+                val count = input.read(header)
+                if (count < 12) return false
+                val isMp4 = header[4] == 'f'.code.toByte() && header[5] == 't'.code.toByte() &&
+                    header[6] == 'y'.code.toByte() && header[7] == 'p'.code.toByte()
+                val isWebm = header[0] == 0x1A.toByte() && header[1] == 0x45.toByte() &&
+                    header[2] == 0xDF.toByte() && header[3] == 0xA3.toByte()
+                val isMpegAudio = header[0] == 'I'.code.toByte() && header[1] == 'D'.code.toByte() &&
+                    header[2] == '3'.code.toByte()
+                isMp4 || isWebm || (mimeType.startsWith("audio/") && isMpegAudio)
+            }
+        } catch (_: Exception) { false }
     }
 
     private fun resolveUrl(baseUrl: String, relativeUrl: String): String {
