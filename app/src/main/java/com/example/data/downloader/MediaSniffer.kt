@@ -173,7 +173,8 @@ object MediaSniffer {
                                     if (fUrl) {
                                         var cLen = parseInt(f.contentLength) || 0;
                                         formats.push({
-                                            quality: f.qualityLabel || (f.height ? f.height + 'p' : '720p HD'),
+                                            quality: f.qualityLabel || (f.height ? f.height + 'p' : ''),
+                                            height: parseInt(f.height) || 0,
                                             url: fUrl,
                                             mimeType: f.mimeType || 'video/mp4',
                                             contentLength: cLen,
@@ -194,7 +195,8 @@ object MediaSniffer {
                                         var isAudio = (f.mimeType && f.mimeType.indexOf('audio') >= 0);
                                         var cLen = parseInt(f.contentLength) || 0;
                                         formats.push({
-                                            quality: isAudio ? 'صوت فقط MP3/M4A (عالي النقاء)' : (f.qualityLabel || (f.height ? f.height + 'p' : 'دقة عالية')),
+                                            quality: isAudio ? 'صوت فقط MP3/M4A (عالي النقاء)' : (f.qualityLabel || (f.height ? f.height + 'p' : '')),
+                                            height: parseInt(f.height) || 0,
                                             url: fUrl,
                                             mimeType: f.mimeType || (isAudio ? 'audio/mp4' : 'video/mp4'),
                                             contentLength: cLen,
@@ -380,10 +382,13 @@ object MediaSniffer {
                     val obj = formatsArray.getJSONObject(i)
                     val rawUrl = obj.optString("url")
                     val url = cleanRangeParams(rawUrl)
-                    val q = obj.optString("quality", "720p HD")
-                    var size = obj.optLong("contentLength", 0L)
                     val isAudio = obj.optBoolean("isAudio", false)
+                    val height = obj.optInt("height", 0)
+                    if (!isAudio && height <= 0) continue
+                    val q = obj.optString("quality").ifBlank { "${height}p" }
+                    var size = obj.optLong("contentLength", 0L)
                     val mime = obj.optString("mimeType", if (isAudio) "audio/mp4" else "video/mp4")
+                    if (!isAudio && qualities.any { !it.isAudioOnly && Regex("(\\d{3,4})p").find(it.label)?.groupValues?.getOrNull(1)?.toIntOrNull() == height }) continue
 
                     val urlContentLength = Uri.parse(url).getQueryParameter("clen")?.toLongOrNull() ?: 0L
                     if (size == 0L && urlContentLength > 0L) {
@@ -630,16 +635,10 @@ object MediaSniffer {
             val parsedClen = runCatching { Uri.parse(url).getQueryParameter("clen")?.toLongOrNull() }.getOrNull() ?: 0L
             val finalSize = if (parsedClen > 0L) parsedClen else sizeBytes.coerceAtLeast(0L)
 
-            val ytLabel = when (itag) {
-                22 -> "720p HD (فيديو وصوت كامل MP4)"
-                18 -> "360p SD (فيديو وصوت كامل MP4)"
-                137 -> "1080p Full HD"
-                136 -> "720p HD"
-                135 -> "480p SD"
-                134 -> "360p SD"
-                140 -> "صوت عالي النقاء M4A/MP3"
-                251 -> "صوت نقي Opus WebM"
-                else -> if (isAudio) "مقطع صوتي (نقي)" else if (detectedHeight > 0) "${detectedHeight}p" else "فيديو يوتيوب"
+            val ytLabel = when {
+                isAudio -> if (itag == 140) "صوت عالي النقاء M4A/MP3" else if (itag == 251) "صوت نقي Opus WebM" else "مقطع صوتي (نقي)"
+                detectedHeight > 0 -> "${detectedHeight}p"
+                else -> "فيديو يوتيوب"
             }
 
             return listOf(

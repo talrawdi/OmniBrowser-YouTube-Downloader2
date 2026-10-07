@@ -160,20 +160,25 @@ object YouTubeExtractor {
     }
 
     private suspend fun extractUncached(videoId: String, originalInput: String): YouTubeVideoInfo? = withContext(Dispatchers.IO) {
-        DiagnosticLogger.i("YouTubeExtractor", "بدء الاستخراج المحلي أولًا ($videoId)...")
-        // Local page extraction is deliberately first. It uses one request and avoids
-        // sending every probe through a remote service or several Innertube clients.
-        extractViaWebPage(videoId)?.let {
-            if (it.streams.isNotEmpty()) {
-                DiagnosticLogger.i("YouTubeExtractor", "نجح الاستخراج المحلي من صفحة YouTube ($videoId)")
-                return@withContext it
+        DiagnosticLogger.i("YouTubeExtractor", "بدء الاستخراج المحلي المتدرج ($videoId)...")
+        // Innertube is the reliable local path: it returns the exact formats that
+        // YouTube made available for this video, including 240p/360p progressive MP4.
+        for (client in listOf("ANDROID_VR", "IOS", "TVHTML5", "ANDROID")) {
+            extractViaInnertube(videoId, client)?.let {
+                if (it.streams.isNotEmpty()) {
+                    DiagnosticLogger.i("YouTubeExtractor", "نجح Innertube المحلي عبر $client ($videoId): ${it.streams.size} صيغة")
+                    return@withContext it
+                }
             }
         }
-        // Bounded public fallback; never fan out across multiple YouTube clients.
+        // Page parsing is a bounded local fallback.
+        extractViaWebPage(videoId)?.let {
+            if (it.streams.isNotEmpty()) return@withContext it
+        }
+        // Public fallback, then Render as the final resolver.
         extractViaInvidiousFallback(videoId)?.let {
             if (it.streams.isNotEmpty()) return@withContext it
         }
-        // Render remains a last-resort resolver when local WebView/page data is unavailable.
         extractViaRenderBackend(videoId, originalInput)?.let {
             if (it.streams.isNotEmpty()) {
                 DiagnosticLogger.i("YouTubeExtractor", "نجح الاستخراج الاحتياطي عبر Render ($videoId)")
@@ -362,9 +367,8 @@ object YouTubeExtractor {
                 if (!rawUrl.isNullOrBlank()) {
                     val itag = f.optInt("itag", 0)
                     val height = f.optInt("height", 0)
-                    val qualityLabel = f.optString("qualityLabel").ifBlank {
-                        if (height > 0) "${height}p HD" else "720p HD"
-                    }
+                    if (height <= 0) continue
+                    val qualityLabel = f.optString("qualityLabel").ifBlank { "${height}p" }
                     val mime = f.optString("mimeType", "video/mp4").substringBefore(';').trim()
                     val cLen = f.optString("contentLength").toLongOrNull() ?: f.optLong("contentLength", 0L)
                     val bitrate = f.optString("bitrate").toLongOrNull() ?: f.optLong("bitrate", 0L)
@@ -387,71 +391,44 @@ object YouTubeExtractor {
             }
         }
 
-        // 2. Adaptive streams (High resolution 1080p, 480p, and dedicated Audio tracks)
+        // 2. Adaptive streams. Keep every real video height, but never create
+        // a quality merely because an itag is known. Prefer progressive formats
+        // when the same height already exists because they include audio.
         val adaptiveFormats = streamingData.optJSONArray("adaptiveFormats")
         if (adaptiveFormats != null) {
             for (i in 0 until adaptiveFormats.length()) {
                 val f = adaptiveFormats.getJSONObject(i)
-                val rawUrl = resolveStreamUrl(f)
-                if (!rawUrl.isNullOrBlank()) {
-                    val itag = f.optInt("itag", 0)
-                    val mime = f.optString("mimeType", "").substringBefore(';').trim()
-                    val isAudio = mime.startsWith("audio")
-                    val height = f.optInt("height", 0)
-                    val qualityLabel = f.optString("qualityLabel", "")
-                    val cLen = f.optString("contentLength").toLongOrNull() ?: f.optLong("contentLength", 0L)
-                    val bitrate = f.optString("bitrate").toLongOrNull() ?: f.optLong("bitrate", 0L)
-                    val size = calculateStreamSize(cLen, bitrate, duration, height, isAudio = isAudio)
-                    val cleanUrl = cleanRangeParams(rawUrl)
-
-                    if (isAudio) {
-                        // Extract only best audio format (prefer M4A/AAC for broad compatibility)
-                        val isM4a = mime.contains("mp4") || mime.contains("m4a")
-                        val label = if (isM4a) "صوت فقط M4A/MP3 (عالي النقاء)" else "صوت فقط Opus WebM"
-                        if (isM4a || !streamsList.any { it.isAudioOnly }) {
-                            streamsList.add(
-                                YouTubeStream(
-                                    itag = itag,
-                                    quality = label,
-                                    url = cleanUrl,
-                                    mimeType = if (isM4a) "audio/mp4" else "audio/webm",
-                                    sizeBytes = size,
-                                    isAudioOnly = true,
-                                    isVideoOnly = false,
-                                    isEstimatedSize = (cLen == 0L),
-                                    clientSource = clientType
-                                )
-                            )
-                        }
-                    } else if (qualityLabel.contains("1080") && !streamsList.any { it.quality.contains("1080") }) {
-                        streamsList.add(
-                            YouTubeStream(
-                                itag = itag,
-                                quality = "1080p Full HD فائقة الدقة",
-                                url = cleanUrl,
-                                mimeType = mime.ifBlank { "video/mp4" },
-                                sizeBytes = size,
-                                isAudioOnly = false,
-                                isVideoOnly = true,
-                                isEstimatedSize = (cLen == 0L),
-                                clientSource = clientType
-                            )
-                        )
-                    } else if (qualityLabel.contains("480") && !streamsList.any { it.quality.contains("480") }) {
-                        streamsList.add(
-                            YouTubeStream(
-                                itag = itag,
-                                quality = "480p SD دقة متوسطة (توفير بيانات)",
-                                url = cleanUrl,
-                                mimeType = mime.ifBlank { "video/mp4" },
-                                sizeBytes = size,
-                                isAudioOnly = false,
-                                isVideoOnly = true,
-                                isEstimatedSize = (cLen == 0L),
-                                clientSource = clientType
-                            )
-                        )
+                val rawUrl = resolveStreamUrl(f) ?: continue
+                val mime = f.optString("mimeType", "").substringBefore(';').trim()
+                val isAudio = mime.startsWith("audio")
+                val height = f.optInt("height", 0)
+                val cLen = f.optString("contentLength").toLongOrNull() ?: f.optLong("contentLength", 0L)
+                val bitrate = f.optString("bitrate").toLongOrNull() ?: f.optLong("bitrate", 0L)
+                val size = calculateStreamSize(cLen, bitrate, duration, height, isAudio)
+                val cleanUrl = cleanRangeParams(rawUrl)
+                if (isAudio) {
+                    val isM4a = mime.contains("mp4") || mime.contains("m4a")
+                    if (isM4a || !streamsList.any { it.isAudioOnly }) {
+                        streamsList.add(YouTubeStream(
+                            itag = f.optInt("itag", 0),
+                            quality = if (isM4a) "صوت فقط M4A/MP3 (عالي النقاء)" else "صوت فقط Opus WebM",
+                            url = cleanUrl,
+                            mimeType = if (isM4a) "audio/mp4" else "audio/webm",
+                            sizeBytes = size,
+                            isAudioOnly = true,
+                            clientSource = clientType
+                        ))
                     }
+                } else if (height > 0 && !streamsList.any { !it.isAudioOnly && Regex("${height}p").containsMatchIn(it.quality) }) {
+                    streamsList.add(YouTubeStream(
+                        itag = f.optInt("itag", 0),
+                        quality = "${height}p${if (height >= 720) " HD" else " SD"} (فيديو فقط)",
+                        url = cleanUrl,
+                        mimeType = mime.ifBlank { "video/mp4" },
+                        sizeBytes = size,
+                        isVideoOnly = true,
+                        clientSource = clientType
+                    ))
                 }
             }
         }
