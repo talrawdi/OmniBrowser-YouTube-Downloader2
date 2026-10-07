@@ -2,6 +2,7 @@ package com.example.data.downloader
 
 import android.net.Uri
 import com.example.data.diagnostics.DiagnosticLogger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -66,14 +67,18 @@ object YouTubeExtractor {
     const val RENDER_BACKEND_URL = "https://omnibrowser-media-api.onrender.com"
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()
 
     // Cache of decipher scripts and operations
     private val decipherFunctionsCache = ConcurrentHashMap<String, List<DecipherOperation>>()
+    private data class CachedExtraction(val info: YouTubeVideoInfo, val expiresAt: Long)
+    private val extractionCache = ConcurrentHashMap<String, CachedExtraction>()
+    private val extractionInFlight = ConcurrentHashMap<String, CompletableDeferred<YouTubeVideoInfo?>>()
+    private const val EXTRACTION_CACHE_TTL_MS = 90_000L
     @Volatile private var cachedPlayerJsUrl: String? = null
 
     sealed class DecipherOperation {
@@ -122,52 +127,57 @@ object YouTubeExtractor {
     /**
      * Main on-device extraction pipeline.
      */
-    suspend fun extract(videoIdOrUrl: String): YouTubeVideoInfo? = withContext(Dispatchers.IO) {
-        val videoId = extractVideoId(videoIdOrUrl) ?: return@withContext null
-        DiagnosticLogger.i("YouTubeExtractor", "بدء استخراج بيانات الفيديو ($videoId)...")
+    suspend fun extract(videoIdOrUrl: String): YouTubeVideoInfo? {
+        val videoId = extractVideoId(videoIdOrUrl) ?: return null
+        val now = System.currentTimeMillis()
+        extractionCache[videoId]?.let { cached ->
+            if (cached.expiresAt > now) {
+                DiagnosticLogger.i("YouTubeExtractor", "استخدام نتيجة الاستخراج المخزنة مؤقتًا ($videoId) لمنع تكرار طلب YouTube")
+                return cached.info
+            }
+            extractionCache.remove(videoId, cached)
+        }
+        extractionInFlight[videoId]?.let { existing ->
+            DiagnosticLogger.i("YouTubeExtractor", "الانتظار لطلب استخراج قائم بدل إرسال طلب مكرر ($videoId)")
+            return existing.await()
+        }
+        val deferred = CompletableDeferred<YouTubeVideoInfo?>()
+        val existing = extractionInFlight.putIfAbsent(videoId, deferred)
+        if (existing != null) return existing.await()
+        try {
+            val result = extractUncached(videoId, videoIdOrUrl)
+            if (result != null && result.streams.isNotEmpty()) {
+                extractionCache[videoId] = CachedExtraction(result, System.currentTimeMillis() + EXTRACTION_CACHE_TTL_MS)
+            }
+            deferred.complete(result)
+            return result
+        } catch (e: Exception) {
+            deferred.complete(null)
+            throw e
+        } finally {
+            extractionInFlight.remove(videoId, deferred)
+        }
+    }
 
-        // Strategy 0: Custom High-Performance Render Backend API (https://omnibrowser-media-api.onrender.com)
-        extractViaRenderBackend(videoId, videoIdOrUrl)?.let {
+    private suspend fun extractUncached(videoId: String, originalInput: String): YouTubeVideoInfo? = withContext(Dispatchers.IO) {
+        DiagnosticLogger.i("YouTubeExtractor", "بدء استخراج بيانات الفيديو عبر Render أولًا ($videoId)...")
+        extractViaRenderBackend(videoId, originalInput)?.let {
             if (it.streams.isNotEmpty()) {
                 DiagnosticLogger.i("YouTubeExtractor", "تم استخراج الروابط المباشرة عبر خادم Render بنجاح!")
                 return@withContext it
             }
         }
-
-        // Strategy 1: High-Speed Direct Proxy Invidious Network (Instant working MP4 streams)
+        // Only controlled fallbacks after Render. Avoid multiple Innertube clients,
+        // which caused repeated requests and Google's sorry/CAPTCHA page.
         extractViaInvidiousFallback(videoId)?.let {
             if (it.streams.isNotEmpty()) return@withContext it
         }
-
-        // Strategy 2: ANDROID_VR Innertube (Returns direct un-throttled progressive MP4s)
-        extractViaInnertube(videoId, "ANDROID_VR")?.let {
-            if (it.streams.isNotEmpty()) return@withContext it
-        }
-
-        // Strategy 3: IOS Innertube
-        extractViaInnertube(videoId, "IOS")?.let {
-            if (it.streams.isNotEmpty()) return@withContext it
-        }
-
-        // Strategy 4: TV Embedded Innertube
-        extractViaInnertube(videoId, "TVHTML5")?.let {
-            if (it.streams.isNotEmpty()) return@withContext it
-        }
-
-        // Strategy 5: Standard ANDROID Innertube
-        extractViaInnertube(videoId, "ANDROID")?.let {
-            if (it.streams.isNotEmpty()) return@withContext it
-        }
-
-        // Strategy 6: Web page HTML initial player response parsing
         extractViaWebPage(videoId)?.let {
             if (it.streams.isNotEmpty()) return@withContext it
         }
-
-        DiagnosticLogger.w("YouTubeExtractor", "تعذر استخراج دقات الفيديو ($videoId) بعد تجربة جميع المنافذ المحلية")
+        DiagnosticLogger.w("YouTubeExtractor", "تعذر استخراج دقات الفيديو ($videoId) بعد Render والبدائل المحدودة")
         null
     }
-
     /**
      * Resolves a single direct stream for playback or direct download.
      */
