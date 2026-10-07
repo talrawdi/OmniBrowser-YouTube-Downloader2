@@ -888,8 +888,9 @@ object DownloadManager {
                     .header("Connection", "keep-alive")
 
                 if (!urlToTry.contains("flokinet") && !urlToTry.contains("invidious")) {
+                    // Media requests made by WebView do not carry a page Origin.
+                    // Adding it to googlevideo requests can turn a valid signed URL into 403.
                     reqBuilder.header("Referer", attemptReferer)
-                    reqBuilder.header("Origin", "https://www.youtube.com")
                     if (attemptCookies.isNotBlank()) reqBuilder.header("Cookie", attemptCookies)
                 }
 

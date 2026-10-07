@@ -406,7 +406,10 @@ object MediaSniffer {
                     } else
 
                     if (url.isNotBlank()) {
-                        val headers = mapOf(
+                        // Do not overwrite headers captured from the actual WebView request.
+                        // GoogleVideo can reject a valid signed URL when the UA/Referer changes.
+                        val captured = capturedHeaders[url] ?: capturedHeaders[rawUrl]
+                        val headers = captured ?: mapOf(
                             "User-Agent" to "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36",
                             "Referer" to pageUrl
                         )
