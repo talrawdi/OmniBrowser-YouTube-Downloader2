@@ -47,6 +47,8 @@ object DownloadManager {
     // v2 avoids inheriting the old LOW-importance channel created by earlier APKs.
     private const val CHANNEL_ID = "downloads_channel_v2"
     private val activeJobs = ConcurrentHashMap<String, Job>()
+    private val downloadHeaders = ConcurrentHashMap<String, Map<String, String>>()
+    private val inFlightFingerprints = ConcurrentHashMap<String, String>()
     private val managerScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     var speedBoosterEnabled: Boolean = true
@@ -110,7 +112,17 @@ object DownloadManager {
         destination: StorageDestination = preferredDestination
     ): String {
         if (!initialized) init(context.applicationContext)
+        val cleanDownloadUrl = MediaSniffer.cleanRangeParams(url)
+        val fingerprint = downloadFingerprint(cleanDownloadUrl, quality, mimeType, pageUrl)
         val downloadId = java.util.UUID.randomUUID().toString()
+        val existingId = inFlightFingerprints.putIfAbsent(fingerprint, downloadId)
+        if (existingId != null) {
+            DiagnosticLogger.i("Downloader", "تم تجاهل تنزيل مكرر لنفس فيديو/جودة YouTube: $existingId")
+            return existingId
+        }
+        downloadHeaders[downloadId] = MediaSniffer.capturedHeaders[cleanDownloadUrl]
+            ?: MediaSniffer.capturedHeaders[url]
+            ?: emptyMap()
         val cleanName = sanitizeFileName(title)
         val ext = when {
             mimeType.contains("subrip", true) || mimeType.contains("srt", true) -> ".srt"
@@ -132,8 +144,6 @@ object DownloadManager {
             val subExt = if (subtitleUrl.endsWith(".srt")) ".srt" else ".vtt"
             subLocalPath = File(targetDir, "$cleanName$subExt").absolutePath
         }
-
-        val cleanDownloadUrl = MediaSniffer.cleanRangeParams(url)
 
         val entity = DownloadEntity(
             id = downloadId,
@@ -179,6 +189,8 @@ object DownloadManager {
 
             enqueueDownloadWork(appContext, effectiveEntity.id)
             } catch (e: Exception) {
+                inFlightFingerprints.remove(fingerprint, downloadId)
+                downloadHeaders.remove(downloadId)
                 DiagnosticLogger.e("Downloader", "تعذر تجهيز التنزيل: ${e.message}", e)
                 runCatching { AppDatabase.getInstance(context.applicationContext).downloadDao().updateStatus(downloadId, "FAILED", e.localizedMessage ?: "تعذر بدء التنزيل") }
             }
@@ -219,6 +231,8 @@ object DownloadManager {
         managerScope.launch {
             val db = AppDatabase.getInstance(context)
             val entity = db.downloadDao().getDownloadById(downloadId)
+            inFlightFingerprints.entries.removeIf { it.value == downloadId }
+            downloadHeaders.remove(downloadId)
             if (entity != null) {
                 if (deleteFile) {
                     deleteStoredFile(context, entity.localPath)
@@ -467,6 +481,8 @@ object DownloadManager {
             } finally {
                 try { raf?.close() } catch (_: Exception) {}
                 activeJobs.remove(entity.id)
+                inFlightFingerprints.entries.removeIf { it.value == entity.id }
+                downloadHeaders.remove(entity.id)
             }
         }
         activeJobs[entity.id] = job
@@ -781,15 +797,17 @@ object DownloadManager {
             ?: YouTubeExtractor.extractVideoId(currentUrl)
             ?: YouTubeExtractor.extractVideoId(entity.pageUrl.orEmpty())
 
-        val savedHeaders = MediaSniffer.capturedHeaders[currentUrl]
+        val savedHeaders = downloadHeaders[entity.id]
+            ?.takeIf { it.isNotEmpty() }
+            ?: MediaSniffer.capturedHeaders[currentUrl]
             ?: MediaSniffer.capturedHeaders[MediaSniffer.cleanRangeParams(currentUrl)]
             ?: emptyMap()
 
         val webUserAgent = savedHeaders["User-Agent"]
             ?: "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
 
-        val referer = entity.pageUrl ?: "https://www.youtube.com/"
-        val cookies = runCatching {
+        val referer = savedHeaders["Referer"] ?: entity.pageUrl ?: "https://www.youtube.com/"
+        val cookies = savedHeaders["Cookie"] ?: runCatching {
             CookieManager.getInstance().getCookie("https://www.youtube.com")
         }.getOrNull().orEmpty()
 
@@ -811,19 +829,22 @@ object DownloadManager {
         val isAudio = entity.mimeType.contains("audio") || entity.quality.contains("صوت")
 
         // Helper function to attempt streaming from a given URL
-        suspend fun tryStreamUrl(urlToTry: String): Boolean {
+        suspend fun tryStreamUrl(urlToTry: String, attemptHeaders: Map<String, String> = savedHeaders): Boolean {
             var raf: RandomAccessFile? = null
             try {
+                val attemptUserAgent = attemptHeaders["User-Agent"] ?: webUserAgent
+                val attemptReferer = attemptHeaders["Referer"] ?: referer
+                val attemptCookies = attemptHeaders["Cookie"] ?: cookies
                 val reqBuilder = Request.Builder()
                     .url(urlToTry)
-                    .header("User-Agent", webUserAgent)
+                    .header("User-Agent", attemptUserAgent)
                     .header("Accept", "*/*")
                     .header("Connection", "keep-alive")
 
                 if (!urlToTry.contains("flokinet") && !urlToTry.contains("invidious")) {
-                    reqBuilder.header("Referer", referer)
+                    reqBuilder.header("Referer", attemptReferer)
                     reqBuilder.header("Origin", "https://www.youtube.com")
-                    if (cookies.isNotBlank()) reqBuilder.header("Cookie", cookies)
+                    if (attemptCookies.isNotBlank()) reqBuilder.header("Cookie", attemptCookies)
                 }
 
                 // Always request the byte range, including the initial bytes=0-
@@ -910,16 +931,21 @@ object DownloadManager {
             }
         }
 
-        // 1. Try initial stream URL
-        var success = tryStreamUrl(currentUrl)
+        // 1. Primary path: stream the exact URL captured by WebView with its live headers.
+        DiagnosticLogger.i("Downloader", "محاولة رابط WebView المباشر أولاً${if (savedHeaders.isNotEmpty()) " مع الرؤوس المحفوظة" else " بدون رؤوس محفوظة"}")
+        var success = tryStreamUrl(currentUrl, savedHeaders)
 
-        // 2. If failed, auto-resolve fresh direct reverse proxy stream via YouTubeExtractor
+        // 2. Only after the direct WebView URL fails, resolve a fresh fallback stream.
         if (!success && isActive && videoId != null) {
             DiagnosticLogger.i("Downloader", "تجديد رابط البث تلقائياً عبر المحلل الموزع...")
             val resolved = YouTubeExtractor.resolveDirectStream(videoId, isAudio)
             if (resolved != null && resolved.url.isNotBlank()) {
                 currentUrl = resolved.url
-                success = tryStreamUrl(currentUrl)
+                val freshHeaders = mapOf(
+                    "User-Agent" to YouTubeExtractor.getUserAgentForClient("ANDROID_VR"),
+                    "Referer" to "https://www.youtube.com/watch?v=$videoId"
+                )
+                success = tryStreamUrl(currentUrl, freshHeaders)
             }
         }
 
@@ -1120,6 +1146,18 @@ object DownloadManager {
             index++
         } while (candidate.exists() && index < 10_000)
         return candidate.name
+    }
+
+    private fun downloadFingerprint(url: String, quality: String, mimeType: String, pageUrl: String?): String {
+        val videoId = YouTubeExtractor.extractVideoId(pageUrl.orEmpty())
+            ?: YouTubeExtractor.extractVideoId(url)
+        if (videoId != null) {
+            val itag = runCatching { Uri.parse(url).getQueryParameter("itag").orEmpty() }.getOrDefault("")
+            val audio = mimeType.contains("audio", true) || quality.contains("صوت")
+            val variant = if (itag.isNotBlank()) itag else quality.trim()
+            return "youtube:$videoId:$variant:$audio"
+        }
+        return "url:${url.lowercase()}:$mimeType"
     }
 
     private fun sanitizeFileName(name: String): String {
