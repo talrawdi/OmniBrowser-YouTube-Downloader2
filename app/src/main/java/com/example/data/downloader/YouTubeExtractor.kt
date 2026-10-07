@@ -160,22 +160,27 @@ object YouTubeExtractor {
     }
 
     private suspend fun extractUncached(videoId: String, originalInput: String): YouTubeVideoInfo? = withContext(Dispatchers.IO) {
-        DiagnosticLogger.i("YouTubeExtractor", "بدء استخراج بيانات الفيديو عبر Render أولًا ($videoId)...")
-        extractViaRenderBackend(videoId, originalInput)?.let {
+        DiagnosticLogger.i("YouTubeExtractor", "بدء الاستخراج المحلي أولًا ($videoId)...")
+        // Local page extraction is deliberately first. It uses one request and avoids
+        // sending every probe through a remote service or several Innertube clients.
+        extractViaWebPage(videoId)?.let {
             if (it.streams.isNotEmpty()) {
-                DiagnosticLogger.i("YouTubeExtractor", "تم استخراج الروابط المباشرة عبر خادم Render بنجاح!")
+                DiagnosticLogger.i("YouTubeExtractor", "نجح الاستخراج المحلي من صفحة YouTube ($videoId)")
                 return@withContext it
             }
         }
-        // Only controlled fallbacks after Render. Avoid multiple Innertube clients,
-        // which caused repeated requests and Google's sorry/CAPTCHA page.
+        // Bounded public fallback; never fan out across multiple YouTube clients.
         extractViaInvidiousFallback(videoId)?.let {
             if (it.streams.isNotEmpty()) return@withContext it
         }
-        extractViaWebPage(videoId)?.let {
-            if (it.streams.isNotEmpty()) return@withContext it
+        // Render remains a last-resort resolver when local WebView/page data is unavailable.
+        extractViaRenderBackend(videoId, originalInput)?.let {
+            if (it.streams.isNotEmpty()) {
+                DiagnosticLogger.i("YouTubeExtractor", "نجح الاستخراج الاحتياطي عبر Render ($videoId)")
+                return@withContext it
+            }
         }
-        DiagnosticLogger.w("YouTubeExtractor", "تعذر استخراج دقات الفيديو ($videoId) بعد Render والبدائل المحدودة")
+        DiagnosticLogger.w("YouTubeExtractor", "تعذر استخراج دقات الفيديو ($videoId) محليًا وبعد البدائل المحدودة")
         null
     }
     /**

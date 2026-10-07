@@ -295,8 +295,8 @@ object DownloadManager {
                 val targetFile = File(entity.localPath)
                 targetFile.parentFile?.mkdirs()
 
-                // If URL is an M3U8 playlist, use dedicated HLS Segment Downloader
-                if (entity.url.contains(".m3u8") || entity.mimeType.contains("mpegurl") || entity.mimeType.contains("m3u8")) {
+                // Local HLS playlist path: parse variants and concatenate permitted segments.
+                if (entity.url.contains(".m3u8", true) || entity.mimeType.contains("mpegurl", true) || entity.mimeType.contains("m3u8", true)) {
                     downloadHlsStream(context, entity, targetFile, db)
                     return@launch
                 }
@@ -640,12 +640,17 @@ object DownloadManager {
     ) = withContext(Dispatchers.IO) {
         DiagnosticLogger.i("Downloader", "بدء تنزيل تدفق HLS M3U8: '${entity.title}'")
         val baseUrl = entity.url
+        val sessionHeaders = downloadHeaders[entity.id]
+            ?: MediaSniffer.capturedHeaders[baseUrl]
+            ?: emptyMap()
 
         val req = Request.Builder()
             .url(baseUrl)
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36")
+            .header("User-Agent", sessionHeaders["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36")
             .apply {
-                entity.pageUrl?.let { header("Referer", it) }
+                sessionHeaders["Cookie"]?.let { header("Cookie", it) }
+                sessionHeaders["Referer"]?.let { header("Referer", it) }
+                    ?: entity.pageUrl?.let { header("Referer", it) }
             }
             .build()
 
@@ -658,9 +663,10 @@ object DownloadManager {
         if (playlistContent.contains("#EXT-X-KEY", ignoreCase = true)) {
             throw IllegalStateException("تدفق HLS مشفر؛ لا يمكن تنزيله دون مسار فك تشفير مسموح")
         }
-        if (playlistContent.contains("#EXT-X-MAP", ignoreCase = true) ||
-            playlistContent.contains("#EXT-X-BYTERANGE", ignoreCase = true)) {
-            throw IllegalStateException("تدفق HLS يستخدم fMP4 أو byte-range ويحتاج remux متخصص")
+        // fMP4 playlists are supported by writing the initialization map before
+        // media fragments. Byte-range playlists still require a range-aware parser.
+        if (playlistContent.contains("#EXT-X-BYTERANGE", ignoreCase = true)) {
+            throw IllegalStateException("قائمة HLS تستخدم byte-range غير مدعوم بأمان")
         }
         var mediaPlaylistUrl = baseUrl
         var mediaPlaylistContent = playlistContent
@@ -686,13 +692,18 @@ object DownloadManager {
             }
         }
 
-        // Extract segment URLs
+        // Extract optional fMP4 initialization map and media segment URLs.
+        var initSegmentUrl: String? = null
+        val mapLine = mediaPlaylistContent.lines().firstOrNull { it.startsWith("#EXT-X-MAP:", true) }
+        if (mapLine != null) {
+            val uriValue = Regex("URI=\"([^\"]+)\"").find(mapLine)?.groupValues?.getOrNull(1)
+            if (!uriValue.isNullOrBlank()) initSegmentUrl = resolveUrl(mediaPlaylistUrl, uriValue)
+        }
         val segmentUrls = mutableListOf<String>()
         val lines = mediaPlaylistContent.lines()
         if (mediaPlaylistContent.contains("#EXT-X-KEY", ignoreCase = true) ||
-            mediaPlaylistContent.contains("#EXT-X-MAP", ignoreCase = true) ||
             mediaPlaylistContent.contains("#EXT-X-BYTERANGE", ignoreCase = true)) {
-            throw IllegalStateException("صيغة HLS هذه غير مدعومة آمنًا للتجميع الحالي")
+            throw IllegalStateException("صيغة HLS مشفرة أو byte-range وغير مدعومة")
         }
         for (line in lines) {
             val trimmed = line.trim()
@@ -709,7 +720,8 @@ object DownloadManager {
 
         var totalDownloadedBytes = 0L
         val totalSegments = segmentUrls.size
-        var estimatedTotalBytes = entity.totalBytes.takeIf { it > 0L } ?: 0L
+        // Segment sizes vary; keep the total unknown unless the caller supplied a confirmed value.
+        val confirmedTotalBytes = entity.totalBytes.takeIf { it > 0L } ?: 0L
         var lastNotificationAt = 0L
         targetFile.delete()
 
@@ -717,24 +729,51 @@ object DownloadManager {
             var lastSpeedCheck = System.currentTimeMillis()
             var bytesSinceSpeedCheck = 0L
 
+            if (initSegmentUrl != null) {
+                val initReq = Request.Builder()
+                    .url(initSegmentUrl!!)
+                    .header("User-Agent", sessionHeaders["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Mobile)")
+                    .apply {
+                        sessionHeaders["Cookie"]?.let { header("Cookie", it) }
+                        sessionHeaders["Referer"]?.let { header("Referer", it) }
+                    }
+                    .build()
+                okHttpClient.newCall(initReq).execute().use { initResp ->
+                    if (!initResp.isSuccessful) throw IllegalStateException("فشل تنزيل تهيئة HLS: ${initResp.code}")
+                    val initBytes = initResp.body?.bytes() ?: ByteArray(0)
+                    if (initBytes.isEmpty()) throw IllegalStateException("تهيئة HLS فارغة")
+                    output.write(initBytes)
+                    totalDownloadedBytes += initBytes.size
+                }
+            }
+
             for ((index, segUrl) in segmentUrls.withIndex()) {
                 if (!coroutineContext.isActive) break
 
                 val segReq = Request.Builder()
                     .url(segUrl)
-                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36")
-                    .apply { entity.pageUrl?.let { header("Referer", it) } }
+                    .header("User-Agent", sessionHeaders["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36")
+                    .apply {
+                        sessionHeaders["Cookie"]?.let { header("Cookie", it) }
+                        sessionHeaders["Referer"]?.let { header("Referer", it) }
+                            ?: entity.pageUrl?.let { header("Referer", it) }
+                    }
                     .build()
 
                 val segResp = okHttpClient.newCall(segReq).execute()
-                if (segResp.isSuccessful) {
-                    val bytes = segResp.body?.bytes() ?: ByteArray(0)
+                if (!segResp.isSuccessful) {
+                    val code = segResp.code
+                    segResp.close()
+                    throw IllegalStateException("فشل تنزيل مقطع HLS ${index + 1}/${segmentUrls.size}: $code")
+                }
+                segResp.use { response ->
+                    val bytes = response.body?.bytes() ?: ByteArray(0)
+                    if (bytes.isEmpty()) throw IllegalStateException("مقطع HLS فارغ: ${index + 1}")
                     output.write(bytes)
                     totalDownloadedBytes += bytes.size
                     bytesSinceSpeedCheck += bytes.size
-                    if (estimatedTotalBytes == 0L && bytes.isNotEmpty()) {
-                        estimatedTotalBytes = bytes.size.toLong() * totalSegments
-                    }
+                    // Do not infer a total from one segment. HLS segment durations
+                    // and byte sizes vary substantially.
 
                     val now = System.currentTimeMillis()
                     val elapsed = now - lastSpeedCheck
@@ -745,10 +784,10 @@ object DownloadManager {
                         bytesSinceSpeedCheck = 0L
                     }
 
-                    db.downloadDao().updateProgress(entity.id, totalDownloadedBytes, estimatedTotalBytes, speed)
+                    db.downloadDao().updateProgress(entity.id, totalDownloadedBytes, confirmedTotalBytes, speed)
                     val notificationNow = System.currentTimeMillis()
                     if (notificationNow - lastNotificationAt >= 750L) {
-                        postDownloadNotification(context, entity, totalDownloadedBytes, estimatedTotalBytes, "جارٍ تنزيل البث", ongoing = true)
+                        postDownloadNotification(context, entity, totalDownloadedBytes, confirmedTotalBytes, "جارٍ تنزيل البث", ongoing = true)
                         lastNotificationAt = notificationNow
                     }
                 }
