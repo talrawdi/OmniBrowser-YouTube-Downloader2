@@ -1099,6 +1099,10 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
                                         // 2. Video Sniffer interceptor
                                         if (MediaSniffer.isMediaResource(reqUrl)) {
                                             val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                                            // WebResourceRequest may omit User-Agent; use the exact WebView UA.
+                                            if (!reqHeaders.containsKey("User-Agent")) {
+                                                view?.settings?.userAgentString?.let { reqHeaders["User-Agent"] = it }
+                                            }
                                             val currentCookies = CookieManager.getInstance().getCookie(reqUrl)
                                                 ?: CookieManager.getInstance().getCookie(activeTab?.url ?: "https://www.youtube.com")
                                             if (!currentCookies.isNullOrBlank()) {

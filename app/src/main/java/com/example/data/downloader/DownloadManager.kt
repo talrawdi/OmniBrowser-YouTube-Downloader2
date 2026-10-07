@@ -841,10 +841,10 @@ object DownloadManager {
             ?: YouTubeExtractor.extractVideoId(currentUrl)
             ?: YouTubeExtractor.extractVideoId(entity.pageUrl.orEmpty())
 
-        val savedHeaders = downloadHeaders[entity.id]
-            ?.takeIf { it.isNotEmpty() }
-            ?: MediaSniffer.capturedHeaders[currentUrl]
+        // Prefer the latest headers captured from the real WebView media request.
+        val savedHeaders = MediaSniffer.capturedHeaders[currentUrl]
             ?: MediaSniffer.capturedHeaders[MediaSniffer.cleanRangeParams(currentUrl)]
+            ?: downloadHeaders[entity.id]?.takeIf { it.isNotEmpty() }
             ?: emptyMap()
 
         val webUserAgent = savedHeaders["User-Agent"]

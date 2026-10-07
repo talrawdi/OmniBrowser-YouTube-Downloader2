@@ -466,13 +466,14 @@ object MediaSniffer {
         if (url.isBlank() || url.startsWith("blob:") || url.startsWith("data:")) return
 
         val cleanUrl = cleanRangeParams(url)
-        if (seenUrls.contains(cleanUrl)) return
-        seenUrls.add(cleanUrl)
-
+        // Keep the newest request headers; the actual media request can arrive
+        // after a short probe that used the same cleaned URL.
         if (headers.isNotEmpty()) {
             capturedHeaders[cleanUrl] = headers
             capturedHeaders[url] = headers
         }
+        if (seenUrls.contains(cleanUrl)) return
+        seenUrls.add(cleanUrl)
 
         // Ignore small ad beacons & tracking analytics
         if (url.contains("googleads") || url.contains("doubleclick") || url.contains("pagead") || url.contains("generate_204") || url.contains("analytics")) {
