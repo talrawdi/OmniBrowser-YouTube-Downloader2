@@ -882,7 +882,7 @@ object YouTubeExtractor {
     }
 
     private fun calculateStreamSize(contentLength: Long, bitrate: Long, duration: Long, height: Int, isAudio: Boolean): Long {
-        // A bitrate estimate is not a file size. Only provider contentLength is valid.
+        // Bitrate × duration is an estimate, never a file size.
         return contentLength.takeIf { it > 0L } ?: 0L
     }
 

@@ -53,8 +53,8 @@ object MediaSniffer {
 
     private val seenUrls = ConcurrentHashMap.newKeySet<String>()
     private val seenVideoIds = ConcurrentHashMap.newKeySet<String>()
-    private val extractingVideoIds = ConcurrentHashMap.newKeySet<String>()
-    private val recentYouTubeCallbacks = ConcurrentHashMap<String, Long>()
+    private val recentYouTubeEvents = ConcurrentHashMap<String, Long>()
+    @Volatile private var currentPageUrl: String = ""
     val capturedHeaders = ConcurrentHashMap<String, Map<String, String>>()
 
     private val httpClient = OkHttpClient.Builder()
@@ -254,10 +254,10 @@ object MediaSniffer {
     """.trimIndent()
 
     fun resetForNewPage(pageUrl: String) {
+        currentPageUrl = pageUrl
         seenUrls.clear()
         seenVideoIds.clear()
-        extractingVideoIds.clear()
-        recentYouTubeCallbacks.clear()
+        recentYouTubeEvents.clear()
         _sniffedMediaList.value = emptyList()
         DiagnosticLogger.d("MediaSniffer", "إعادة ضبط كاشف الوسائط للصفحة: $pageUrl")
 
@@ -269,7 +269,6 @@ object MediaSniffer {
         if (seenVideoIds.contains(videoId)) return
         seenVideoIds.add(videoId)
 
-        if (!extractingVideoIds.add(videoId)) return
         snifferScope.launch {
             try {
                 DiagnosticLogger.i("MediaSniffer", "تم كشف رابط يوتيوب: $videoId - بدء استخراج خيارات الجودة وحساب الحجم")
@@ -287,6 +286,19 @@ object MediaSniffer {
                 fetchYouTubeStreams(videoId, pageUrl)
             }
         }
+    }
+
+    /** Returns true only when media belongs to the active page/video. */
+    fun mediaBelongsToPage(media: SniffedMedia, pageUrl: String): Boolean {
+        if (pageUrl.isBlank() || media.pageUrl.isBlank()) return false
+        val mediaVideoId = extractYouTubeVideoId(media.pageUrl)
+        val pageVideoId = extractYouTubeVideoId(pageUrl)
+        if (mediaVideoId != null || pageVideoId != null) return mediaVideoId != null && mediaVideoId == pageVideoId
+        return runCatching {
+            val a = Uri.parse(media.pageUrl)
+            val b = Uri.parse(pageUrl)
+            a.scheme.equals(b.scheme, true) && a.host.equals(b.host, true) && a.path == b.path
+        }.getOrDefault(media.pageUrl == pageUrl)
     }
 
     private suspend fun fetchYouTubeStreams(videoId: String, pageUrl: String) {
@@ -351,10 +363,13 @@ object MediaSniffer {
         formatsJson: String,
         subsJson: String
     ) {
-        val callbackVideoId = extractYouTubeVideoId(pageUrl) ?: return
+        val pageVideoId = extractYouTubeVideoId(pageUrl)
+        val currentVideoId = extractYouTubeVideoId(currentPageUrl)
+        if (pageVideoId == null || currentVideoId != pageVideoId) return
+        val eventKey = "$pageVideoId|${title.trim()}"
         val now = System.currentTimeMillis()
-        val previous = recentYouTubeCallbacks.put(callbackVideoId, now)
-        if (previous != null && now - previous < 30_000L) return
+        val previous = recentYouTubeEvents.put(eventKey, now)
+        if (previous != null && now - previous < 1500L) return
         snifferScope.launch {
             try {
                 val cleanTitle = cleanMediaTitle(title, pageUrl)
@@ -373,7 +388,7 @@ object MediaSniffer {
                     val urlContentLength = Uri.parse(url).getQueryParameter("clen")?.toLongOrNull() ?: 0L
                     if (size == 0L && urlContentLength > 0L) {
                         size = urlContentLength
-                    }
+                    } else
 
                     if (url.isNotBlank()) {
                         val headers = mapOf(
@@ -469,8 +484,6 @@ object MediaSniffer {
                     if (cLen > 0) contentSize = cLen
                 } catch (_: Exception) {}
 
-
-
                 // Parse subtitles
                 val subtitlesList = mutableListOf<SniffedSubtitle>()
                 try {
@@ -525,7 +538,11 @@ object MediaSniffer {
 
     private fun addOrUpdateMedia(media: SniffedMedia) {
         val current = _sniffedMediaList.value.toMutableList()
-        val existingIndex = current.indexOfFirst { it.title == media.title || it.originalUrl == media.originalUrl }
+        val existingIndex = current.indexOfFirst {
+            it.originalUrl == media.originalUrl ||
+                (it.pageUrl == media.pageUrl && it.title == media.title) ||
+                (extractYouTubeVideoId(it.pageUrl) != null && extractYouTubeVideoId(it.pageUrl) == extractYouTubeVideoId(media.pageUrl))
+        }
         if (existingIndex >= 0) {
             current[existingIndex] = media
         } else {
@@ -632,7 +649,7 @@ object MediaSniffer {
                     sizeBytes = finalSize,
                     isAudioOnly = isAudio,
                     mimeType = if (isAudio) "audio/mp4" else "video/mp4",
-                    isEstimatedSize = (parsedClen == 0L && sizeBytes == 0L)
+                    isEstimatedSize = false
                 )
             )
         }
@@ -644,10 +661,9 @@ object MediaSniffer {
             detectedHeight > 0 -> "${detectedHeight}p"
             else -> "جودة المصدر"
         }
-        val isEstimated = (sizeBytes == 0L)
         val baseSize = sizeBytes.coerceAtLeast(0L)
 
-        return listOf(SniffedQuality(mainLabel, url, baseSize, isEstimatedSize = isEstimated))
+        return listOf(SniffedQuality(mainLabel, url, baseSize, isEstimatedSize = false))
     }
 
     private fun cleanMediaTitle(rawTitle: String, url: String): String {

@@ -185,11 +185,14 @@ object DownloadManager {
             postDownloadNotification(appContext, effectiveEntity, 0L, 0L, "بدء التنزيل", ongoing = true)
             DiagnosticLogger.i("Downloader", "بدء تنزيل: '$title' بجودة $quality إلى: $targetPath")
 
-            if (!subtitleUrl.isNullOrBlank() && resolvedSubPath != null) {
-                downloadSubtitleTrack(subtitleUrl, resolvedSubPath)
-            }
-
             enqueueDownloadWork(appContext, effectiveEntity.id)
+            // Subtitle fetching must never delay the video start. The logs showed
+            // the subtitle request blocking the actual video download for ~30s.
+            if (!subtitleUrl.isNullOrBlank() && resolvedSubPath != null) {
+                managerScope.launch {
+                    downloadSubtitleTrack(subtitleUrl, resolvedSubPath)
+                }
+            }
             } catch (e: Exception) {
                 inFlightFingerprints.remove(fingerprint, downloadId)
                 downloadHeaders.remove(downloadId)
