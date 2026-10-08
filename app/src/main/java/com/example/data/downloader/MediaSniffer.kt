@@ -53,11 +53,7 @@ object MediaSniffer {
 
     private val seenUrls = ConcurrentHashMap.newKeySet<String>()
     private val seenVideoIds = ConcurrentHashMap.newKeySet<String>()
-    private val recentYouTubeEvents = ConcurrentHashMap<String, Long>()
-    @Volatile private var currentPageUrl: String = ""
     val capturedHeaders = ConcurrentHashMap<String, Map<String, String>>()
-    // Maps YouTube itag to the latest URL actually requested by the WebView.
-    private val capturedUrlsByItag = ConcurrentHashMap<Int, String>()
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -167,19 +163,11 @@ object MediaSniffer {
                             if (pr.streamingData.formats) {
                                 pr.streamingData.formats.forEach(function(f) {
                                     var fUrl = f.url;
-                                    if (!fUrl && (f.signatureCipher || f.cipher)) {
-                                        var rawCipher = f.signatureCipher || f.cipher;
-                                        var params = new URLSearchParams(rawCipher);
-                                        fUrl = params.get('url');
-                                    }
                                     if (fUrl) {
                                         var cLen = parseInt(f.contentLength) || 0;
                                         formats.push({
-                                            quality: f.qualityLabel || (f.height ? f.height + 'p' : ''),
-                                            height: parseInt(f.height) || 0,
-                                            itag: parseInt(f.itag) || 0,
+                                            quality: f.qualityLabel || (f.height ? f.height + 'p' : '720p HD'),
                                             url: fUrl,
-                                            cipher: (f.signatureCipher || f.cipher || ''),
                                             mimeType: f.mimeType || 'video/mp4',
                                             contentLength: cLen,
                                             isAudio: false
@@ -190,20 +178,12 @@ object MediaSniffer {
                             if (pr.streamingData.adaptiveFormats) {
                                 pr.streamingData.adaptiveFormats.forEach(function(f) {
                                     var fUrl = f.url;
-                                    if (!fUrl && (f.signatureCipher || f.cipher)) {
-                                        var rawCipher = f.signatureCipher || f.cipher;
-                                        var params = new URLSearchParams(rawCipher);
-                                        fUrl = params.get('url');
-                                    }
                                     if (fUrl) {
                                         var isAudio = (f.mimeType && f.mimeType.indexOf('audio') >= 0);
                                         var cLen = parseInt(f.contentLength) || 0;
                                         formats.push({
-                                            quality: isAudio ? 'صوت فقط MP3/M4A (عالي النقاء)' : (f.qualityLabel || (f.height ? f.height + 'p' : '')),
-                                            height: parseInt(f.height) || 0,
-                                            itag: parseInt(f.itag) || 0,
+                                            quality: isAudio ? 'صوت فقط MP3/M4A (عالي النقاء)' : (f.qualityLabel || (f.height ? f.height + 'p' : 'دقة عالية')),
                                             url: fUrl,
-                                            cipher: (f.signatureCipher || f.cipher || ''),
                                             mimeType: f.mimeType || (isAudio ? 'audio/mp4' : 'video/mp4'),
                                             contentLength: cLen,
                                             isAudio: isAudio
@@ -262,12 +242,8 @@ object MediaSniffer {
     """.trimIndent()
 
     fun resetForNewPage(pageUrl: String) {
-        currentPageUrl = pageUrl
         seenUrls.clear()
         seenVideoIds.clear()
-        recentYouTubeEvents.clear()
-        capturedUrlsByItag.clear()
-        capturedHeaders.clear()
         _sniffedMediaList.value = emptyList()
         DiagnosticLogger.d("MediaSniffer", "إعادة ضبط كاشف الوسائط للصفحة: $pageUrl")
 
@@ -296,19 +272,6 @@ object MediaSniffer {
                 fetchYouTubeStreams(videoId, pageUrl)
             }
         }
-    }
-
-    /** Returns true only when media belongs to the active page/video. */
-    fun mediaBelongsToPage(media: SniffedMedia, pageUrl: String): Boolean {
-        if (pageUrl.isBlank() || media.pageUrl.isBlank()) return false
-        val mediaVideoId = extractYouTubeVideoId(media.pageUrl)
-        val pageVideoId = extractYouTubeVideoId(pageUrl)
-        if (mediaVideoId != null || pageVideoId != null) return mediaVideoId != null && mediaVideoId == pageVideoId
-        return runCatching {
-            val a = Uri.parse(media.pageUrl)
-            val b = Uri.parse(pageUrl)
-            a.scheme.equals(b.scheme, true) && a.host.equals(b.host, true) && a.path == b.path
-        }.getOrDefault(media.pageUrl == pageUrl)
     }
 
     private suspend fun fetchYouTubeStreams(videoId: String, pageUrl: String) {
@@ -349,10 +312,283 @@ object MediaSniffer {
             return
         }
 
-        // YouTubeExtractor already performs the single Render-first request and controlled fallbacks.
-        // Never repeat direct Innertube calls from the sniffer; this avoids YouTube rate limits.
-        DiagnosticLogger.w("MediaSniffer", "لم تُرجع خدمة Render أو البدائل المحدودة رابط فيديو صالحًا ($videoId)")
+        // Multi-client extraction strategy fallback:
+        // 1. ANDROID_VR: Returns direct, un-throttled, progressive MP4 streams (360p, 720p) + audio streams
+        // 2. IOS: High quality progressive and adaptive streams
+        // 3. ANDROID: Standard Android client
+        // 4. TVHTML5_SIMPLY_EMBEDDED_PLAYER: Clean web embed streams
+        val clientConfigs = listOf(
+            Triple("ANDROID_VR", "1.60.19", JSONObject().apply {
+                put("clientName", "ANDROID_VR")
+                put("clientVersion", "1.60.19")
+                put("deviceModel", "Quest 3")
+                put("osName", "Android")
+                put("osVersion", "12")
+                put("hl", "ar")
+                put("gl", "SA")
+            }),
+            Triple("IOS", "19.45.4", JSONObject().apply {
+                put("clientName", "IOS")
+                put("clientVersion", "19.45.4")
+                put("deviceModel", "iPhone16,2")
+                put("osName", "iOS")
+                put("osVersion", "18.1.0.22B83")
+                put("hl", "ar")
+                put("gl", "SA")
+            }),
+            Triple("ANDROID", "19.44.38", JSONObject().apply {
+                put("clientName", "ANDROID")
+                put("clientVersion", "19.44.38")
+                put("androidSdkVersion", 34)
+                put("osName", "Android")
+                put("osVersion", "14")
+                put("hl", "ar")
+                put("gl", "SA")
+            }),
+            Triple("TVHTML5_SIMPLY_EMBEDDED_PLAYER", "2.0", JSONObject().apply {
+                put("clientName", "TVHTML5_SIMPLY_EMBEDDED_PLAYER")
+                put("clientVersion", "2.0")
+                put("clientScreen", "EMBED")
+                put("hl", "ar")
+                put("gl", "SA")
+            })
+        )
+
+        for ((clientName, clientVersion, clientJson) in clientConfigs) {
+            try {
+                val url = "https://www.youtube.com/youtubei/v1/player"
+                val jsonBody = JSONObject().apply {
+                    put("videoId", videoId)
+                    val context = JSONObject().apply {
+                        put("client", clientJson)
+                        if (clientName.contains("TVHTML5")) {
+                            put("thirdParty", JSONObject().apply {
+                                put("embedUrl", "https://www.youtube.com")
+                            })
+                        }
+                    }
+                    put("context", context)
+                }
+
+                val request = Request.Builder()
+                    .url(url)
+                    .post(jsonBody.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .header("User-Agent", "com.google.android.youtube/$clientVersion (Linux; U; Android 14; ar_SA)")
+                    .header("X-YouTube-Client-Name", if (clientName == "ANDROID" || clientName == "ANDROID_VR") "3" else "1")
+                    .header("X-YouTube-Client-Version", clientVersion)
+                    .header("Origin", "https://www.youtube.com")
+                    .header("Referer", "https://www.youtube.com/watch?v=$videoId")
+                    .build()
+
+                val response = httpClient.newCall(request).execute()
+                if (!response.isSuccessful) continue
+
+                val responseText = response.body?.string() ?: continue
+                val json = JSONObject(responseText)
+                val videoDetails = json.optJSONObject("videoDetails") ?: continue
+                val streamingData = json.optJSONObject("streamingData") ?: continue
+
+                val rawTitle = videoDetails.optString("title", "فيديو يوتيوب")
+                val cleanTitle = rawTitle.replace("+", " ").trim()
+                val durationSeconds = videoDetails.optLong("lengthSeconds", 0L).let {
+                    if (it > 0) it else videoDetails.optString("lengthSeconds").toLongOrNull() ?: 0L
+                }
+                var thumbUrl: String? = null
+                videoDetails.optJSONObject("thumbnail")?.optJSONArray("thumbnails")?.let { arr ->
+                    if (arr.length() > 0) {
+                        thumbUrl = arr.getJSONObject(arr.length() - 1).optString("url")
+                    }
+                }
+
+                val qualitiesList = mutableListOf<SniffedQuality>()
+
+                // 1. Progressive Formats (Audio + Video combined in MP4)
+                val formats = streamingData.optJSONArray("formats")
+                if (formats != null) {
+                    for (i in 0 until formats.length()) {
+                        val f = formats.getJSONObject(i)
+                        var streamUrl = f.optString("url")
+                        if (streamUrl.isBlank() && (f.has("signatureCipher") || f.has("cipher"))) {
+                            streamUrl = extractUrlFromCipher(f.optString("signatureCipher", f.optString("cipher")))
+                        }
+
+                        if (streamUrl.isNotBlank()) {
+                            val qualityLabel = f.optString("qualityLabel").ifBlank {
+                                val h = f.optInt("height", 0)
+                                if (h > 0) "${h}p HD" else "720p HD"
+                            }
+                            val cleanUrl = cleanRangeParams(streamUrl)
+                            val rawContentLength = f.optString("contentLength")
+                            val parsedSize = rawContentLength.toLongOrNull() ?: f.optLong("contentLength", 0L)
+                            val urlContentLength = Uri.parse(cleanUrl).getQueryParameter("clen")?.toLongOrNull() ?: 0L
+                            val bitrate = f.optString("bitrate").toLongOrNull() ?: f.optLong("bitrate", 0L)
+
+                            val finalSize = when {
+                                parsedSize > 0L -> parsedSize
+                                urlContentLength > 0L -> urlContentLength
+                                false -> 0L
+                                else -> 0L
+                            }
+
+                            val mime = f.optString("mimeType", "video/mp4")
+                            qualitiesList.add(
+                                SniffedQuality(
+                                    label = "$qualityLabel (فيديو وصوت كامل MP4)",
+                                    url = cleanUrl,
+                                    sizeBytes = finalSize,
+                                    mimeType = mime,
+                                    isEstimatedSize = (parsedSize == 0L && urlContentLength == 0L)
+                                )
+                            )
+                        }
+                    }
+                }
+
+                // 2. Adaptive Formats (High resolutions: 1080p, 480p, Audio MP3/M4A)
+                val adaptiveFormats = streamingData.optJSONArray("adaptiveFormats")
+                if (adaptiveFormats != null) {
+                    for (i in 0 until adaptiveFormats.length()) {
+                        val f = adaptiveFormats.getJSONObject(i)
+                        var streamUrl = f.optString("url")
+                        if (streamUrl.isBlank() && (f.has("signatureCipher") || f.has("cipher"))) {
+                            streamUrl = extractUrlFromCipher(f.optString("signatureCipher", f.optString("cipher")))
+                        }
+
+                        if (streamUrl.isNotBlank()) {
+                            val mime = f.optString("mimeType", "")
+                            val isAudio = mime.contains("audio")
+                            val cleanUrl = cleanRangeParams(streamUrl)
+                            val rawContentLength = f.optString("contentLength")
+                            val parsedSize = rawContentLength.toLongOrNull() ?: f.optLong("contentLength", 0L)
+                            val urlContentLength = Uri.parse(cleanUrl).getQueryParameter("clen")?.toLongOrNull() ?: 0L
+                            val bitrate = f.optString("bitrate").toLongOrNull() ?: f.optLong("bitrate", 0L)
+                            val qualityLabel = f.optString("qualityLabel")
+
+                            val finalSize = when {
+                                parsedSize > 0L -> parsedSize
+                                urlContentLength > 0L -> urlContentLength
+                                false -> 0L
+                                else -> 0L
+                            }
+
+                            if (isAudio && !qualitiesList.any { it.isAudioOnly }) {
+                                qualitiesList.add(
+                                    SniffedQuality(
+                                        label = "صوت فقط MP3/M4A (عالي النقاء)",
+                                        url = cleanUrl,
+                                        sizeBytes = finalSize,
+                                        isAudioOnly = true,
+                                        mimeType = "audio/mp4",
+                                        isEstimatedSize = (parsedSize == 0L && urlContentLength == 0L)
+                                    )
+                                )
+                            } else if (!isAudio && qualityLabel.contains("1080p") && !qualitiesList.any { it.label.contains("1080p") }) {
+                                qualitiesList.add(
+                                    SniffedQuality(
+                                        label = "1080p Full HD فائقة الدقة",
+                                        url = cleanUrl,
+                                        sizeBytes = finalSize,
+                                        mimeType = mime,
+                                        isEstimatedSize = (parsedSize == 0L && urlContentLength == 0L)
+                                    )
+                                )
+                            } else if (!isAudio && qualityLabel.contains("480p") && !qualitiesList.any { it.label.contains("480p") }) {
+                                qualitiesList.add(
+                                    SniffedQuality(
+                                        label = "480p SD دقة متوسطة (توفير بيانات)",
+                                        url = cleanUrl,
+                                        sizeBytes = finalSize,
+                                        mimeType = mime,
+                                        isEstimatedSize = (parsedSize == 0L && urlContentLength == 0L)
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Captions
+                val subsList = mutableListOf<SniffedSubtitle>()
+                json.optJSONObject("captions")?.optJSONObject("playerCaptionsTracklistRenderer")?.optJSONArray("captionTracks")?.let { tracks ->
+                    for (i in 0 until tracks.length()) {
+                        val tr = tracks.getJSONObject(i)
+                        val subUrl = tr.optString("baseUrl")
+                        val name = tr.optJSONObject("name")?.optString("simpleText") ?: tr.optString("languageCode", "ترجمة")
+                        val lang = tr.optString("languageCode", "ar")
+                        if (subUrl.isNotBlank()) {
+                            subsList.add(SniffedSubtitle(subUrl, name, lang, "VTT"))
+                        }
+                    }
+                }
+
+                if (qualitiesList.isNotEmpty()) {
+                    val primaryQuality = qualitiesList.first()
+                    val media = SniffedMedia(
+                        title = cleanTitle,
+                        originalUrl = primaryQuality.url,
+                        pageUrl = pageUrl,
+                        mimeType = primaryQuality.mimeType,
+                        estimatedSizeBytes = primaryQuality.sizeBytes,
+                        qualities = qualitiesList,
+                        subtitles = subsList,
+                        durationSeconds = durationSeconds,
+                        thumbnailUrl = thumbUrl
+                    )
+
+                    addOrUpdateMedia(media)
+                    DiagnosticLogger.s("MediaSniffer", "تم استخراج فيديو يوتيوب بنجاح عبر ($clientName): '$cleanTitle' (${qualitiesList.size} جودات مع الحجم)")
+                    return // Successfully extracted
+                }
+            } catch (e: Exception) {
+                DiagnosticLogger.d("MediaSniffer", "عميل يوتيوب ($clientName): ${e.message}")
+            }
+        }
+
+        // If direct clients failed or were throttled, use Multi-Instance MediaResolver
+        try {
+            val videoResolved = MediaResolver.resolveDirectDownloadStream(videoId, isAudio = false)
+            val audioResolved = MediaResolver.resolveDirectDownloadStream(videoId, isAudio = true)
+            val fallbackQualities = mutableListOf<SniffedQuality>()
+            if (videoResolved != null) {
+                fallbackQualities.add(
+                    SniffedQuality(
+                        label = videoResolved.quality,
+                        url = videoResolved.url,
+                        sizeBytes = videoResolved.sizeBytes,
+                        mimeType = videoResolved.mimeType
+                    )
+                )
+            }
+            if (audioResolved != null) {
+                fallbackQualities.add(
+                    SniffedQuality(
+                        label = audioResolved.quality,
+                        url = audioResolved.url,
+                        sizeBytes = audioResolved.sizeBytes,
+                        isAudioOnly = true,
+                        mimeType = audioResolved.mimeType
+                    )
+                )
+            }
+            if (fallbackQualities.isNotEmpty()) {
+                val primary = fallbackQualities.first()
+                val media = SniffedMedia(
+                    title = "فيديو ($videoId)",
+                    originalUrl = primary.url,
+                    pageUrl = pageUrl,
+                    mimeType = primary.mimeType,
+                    estimatedSizeBytes = primary.sizeBytes,
+                    qualities = fallbackQualities,
+                    durationSeconds = 0L
+                )
+                addOrUpdateMedia(media)
+                DiagnosticLogger.s("MediaSniffer", "تم استخراج فيديو يوتيوب عبر MediaResolver بنجاح")
+            }
+        } catch (e: Exception) {
+            DiagnosticLogger.w("MediaSniffer", "تعذر الاستخراج عبر MediaResolver: ${e.message}")
+        }
     }
+
     private fun extractUrlFromCipher(cipher: String): String {
         try {
             val pairs = cipher.split("&")
@@ -371,15 +607,9 @@ object MediaSniffer {
         thumbnail: String,
         duration: Long,
         formatsJson: String,
-        subsJson: String
+        subsJson: String,
+        userAgent: String
     ) {
-        val pageVideoId = extractYouTubeVideoId(pageUrl)
-        val currentVideoId = extractYouTubeVideoId(currentPageUrl)
-        if (pageVideoId == null || currentVideoId != pageVideoId) return
-        val eventKey = "$pageVideoId|${title.trim()}"
-        val now = System.currentTimeMillis()
-        val previous = recentYouTubeEvents.put(eventKey, now)
-        if (previous != null && now - previous < 1500L) return
         snifferScope.launch {
             try {
                 val cleanTitle = cleanMediaTitle(title, pageUrl)
@@ -389,46 +619,29 @@ object MediaSniffer {
                 for (i in 0 until formatsArray.length()) {
                     val obj = formatsArray.getJSONObject(i)
                     val rawUrl = obj.optString("url")
-                    val itag = obj.optInt("itag", 0)
-                    val cipher = obj.optString("cipher")
-                    val resolvedUrl = if (cipher.isNotBlank()) {
-                        YouTubeExtractor.resolveCipherUrl(cipher) ?: rawUrl
-                    } else rawUrl
-                    // Prefer the exact videoplayback URL observed from WebView for this itag.
-                    val observedUrl = capturedUrlsByItag[itag]
-                    val selectedUrl = observedUrl ?: resolvedUrl
-                    val url = cleanRangeParams(selectedUrl)
-                    if (observedUrl != null) {
-                        DiagnosticLogger.d("MediaSniffer", "تم ربط itag=$itag بالرابط الفعلي الملتقط من WebView")
-                    }
-                    val isAudio = obj.optBoolean("isAudio", false)
-                    val height = obj.optInt("height", 0)
-                    if (!isAudio && height <= 0) continue
-                    if (url.isBlank()) {
-                        DiagnosticLogger.w("MediaSniffer", "تم تجاهل صيغة YouTube بلا رابط صالح بعد فك signatureCipher")
-                        continue
-                    }
-                    val q = obj.optString("quality").ifBlank { "${height}p" }
+                    val url = cleanRangeParams(rawUrl)
+                    val q = obj.optString("quality", "720p HD")
                     var size = obj.optLong("contentLength", 0L)
+                    val isAudio = obj.optBoolean("isAudio", false)
                     val mime = obj.optString("mimeType", if (isAudio) "audio/mp4" else "video/mp4")
-                    if (!isAudio && qualities.any { !it.isAudioOnly && Regex("(\\d{3,4})p").find(it.label)?.groupValues?.getOrNull(1)?.toIntOrNull() == height }) continue
 
                     val urlContentLength = Uri.parse(url).getQueryParameter("clen")?.toLongOrNull() ?: 0L
                     if (size == 0L && urlContentLength > 0L) {
                         size = urlContentLength
-                    } else
+                    } else if (size == 0L) {
+                        size = 0L
+                    }
 
                     if (url.isNotBlank()) {
-                        // Do not overwrite headers captured from the actual WebView request.
-                        // GoogleVideo can reject a valid signed URL when the UA/Referer changes.
-                        val captured = capturedHeaders[url] ?: capturedHeaders[rawUrl]
-                        val headers = captured ?: mapOf(
-                            "User-Agent" to "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36",
+                        val headers = mapOf(
+                            "User-Agent" to userAgent.ifBlank {
+                                "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+                            },
                             "Referer" to pageUrl
                         )
                         capturedHeaders[url] = headers
                         capturedHeaders[rawUrl] = headers
-                        qualities.add(SniffedQuality(q, url, size, isAudio, mime, isEstimatedSize = false))
+                        qualities.add(SniffedQuality(q, url, size, isAudio, mime, isEstimatedSize = (obj.optLong("contentLength", 0L) == 0L && urlContentLength == 0L)))
                     }
                 }
 
@@ -479,18 +692,13 @@ object MediaSniffer {
         if (url.isBlank() || url.startsWith("blob:") || url.startsWith("data:")) return
 
         val cleanUrl = cleanRangeParams(url)
-        val itag = runCatching { Uri.parse(cleanUrl).getQueryParameter("itag")?.toIntOrNull() ?: 0 }.getOrDefault(0)
-        if (itag > 0 && (cleanUrl.contains("googlevideo.com") || cleanUrl.contains("videoplayback"))) {
-            capturedUrlsByItag[itag] = cleanUrl
-        }
-        // Keep the newest request headers; the actual media request can arrive
-        // after a short probe that used the same cleaned URL.
+        if (seenUrls.contains(cleanUrl)) return
+        seenUrls.add(cleanUrl)
+
         if (headers.isNotEmpty()) {
             capturedHeaders[cleanUrl] = headers
             capturedHeaders[url] = headers
         }
-        if (seenUrls.contains(cleanUrl)) return
-        seenUrls.add(cleanUrl)
 
         // Ignore small ad beacons & tracking analytics
         if (url.contains("googleads") || url.contains("doubleclick") || url.contains("pagead") || url.contains("generate_204") || url.contains("analytics")) {
@@ -519,6 +727,10 @@ object MediaSniffer {
                     val cLen = response.header("Content-Length")?.toLongOrNull() ?: 0L
                     if (cLen > 0) contentSize = cLen
                 } catch (_: Exception) {}
+
+                if (contentSize == 0L) {
+                    contentSize = 0L
+                }
 
                 // Parse subtitles
                 val subtitlesList = mutableListOf<SniffedSubtitle>()
@@ -574,11 +786,7 @@ object MediaSniffer {
 
     private fun addOrUpdateMedia(media: SniffedMedia) {
         val current = _sniffedMediaList.value.toMutableList()
-        val existingIndex = current.indexOfFirst {
-            it.originalUrl == media.originalUrl ||
-                (it.pageUrl == media.pageUrl && it.title == media.title) ||
-                (extractYouTubeVideoId(it.pageUrl) != null && extractYouTubeVideoId(it.pageUrl) == extractYouTubeVideoId(media.pageUrl))
-        }
+        val existingIndex = current.indexOfFirst { it.title == media.title || it.originalUrl == media.originalUrl }
         if (existingIndex >= 0) {
             current[existingIndex] = media
         } else {
@@ -619,7 +827,7 @@ object MediaSniffer {
                                 url = candidateUrl,
                                 sizeBytes = length,
                                 mimeType = if (type.startsWith("video/")) type.substringBefore(';') else mimeType,
-                                isEstimatedSize = false
+                                isEstimatedSize = length == 0L
                             )
                         )
                     }
@@ -664,12 +872,18 @@ object MediaSniffer {
             val mimeParam = runCatching { Uri.parse(url).getQueryParameter("mime") }.getOrNull()?.lowercase() ?: ""
             val isAudio = mimeParam.startsWith("audio") || itag in listOf(140, 141, 251, 250, 249, 171)
             val parsedClen = runCatching { Uri.parse(url).getQueryParameter("clen")?.toLongOrNull() }.getOrNull() ?: 0L
-            val finalSize = if (parsedClen > 0L) parsedClen else sizeBytes.coerceAtLeast(0L)
+            val finalSize = if (parsedClen > 0L) parsedClen else if (sizeBytes > 0L) sizeBytes else 0L
 
-            val ytLabel = when {
-                isAudio -> if (itag == 140) "صوت عالي النقاء M4A/MP3" else if (itag == 251) "صوت نقي Opus WebM" else "مقطع صوتي (نقي)"
-                detectedHeight > 0 -> "${detectedHeight}p"
-                else -> "فيديو يوتيوب"
+            val ytLabel = when (itag) {
+                22 -> "720p HD (فيديو وصوت كامل MP4)"
+                18 -> "360p SD (فيديو وصوت كامل MP4)"
+                137 -> "1080p Full HD"
+                136 -> "720p HD"
+                135 -> "480p SD"
+                134 -> "360p SD"
+                140 -> "صوت عالي النقاء M4A/MP3"
+                251 -> "صوت نقي Opus WebM"
+                else -> if (isAudio) "مقطع صوتي (نقي)" else if (detectedHeight > 0) "${detectedHeight}p" else "فيديو يوتيوب"
             }
 
             return listOf(
@@ -679,7 +893,7 @@ object MediaSniffer {
                     sizeBytes = finalSize,
                     isAudioOnly = isAudio,
                     mimeType = if (isAudio) "audio/mp4" else "video/mp4",
-                    isEstimatedSize = false
+                    isEstimatedSize = (parsedClen == 0L && sizeBytes == 0L)
                 )
             )
         }
@@ -691,9 +905,10 @@ object MediaSniffer {
             detectedHeight > 0 -> "${detectedHeight}p"
             else -> "جودة المصدر"
         }
-        val baseSize = sizeBytes.coerceAtLeast(0L)
+        val isEstimated = (sizeBytes == 0L)
+        val baseSize = if (sizeBytes > 0) sizeBytes else 0L
 
-        return listOf(SniffedQuality(mainLabel, url, baseSize, isEstimatedSize = false))
+        return listOf(SniffedQuality(mainLabel, url, baseSize, isEstimatedSize = isEstimated))
     }
 
     private fun cleanMediaTitle(rawTitle: String, url: String): String {
@@ -741,11 +956,11 @@ object MediaSniffer {
     }
 
     fun formatFileSize(bytes: Long, isEstimated: Boolean = false): String {
-        if (bytes <= 0L) return "الحجم غير متاح"
+        if (bytes <= 0L) return "غير متاح"
         val kb = bytes / 1024.0
         val mb = kb / 1024.0
         val gb = mb / 1024.0
-        val prefix = ""
+        val prefix = if (isEstimated) "~ " else ""
         return when {
             gb >= 1.0 -> String.format(java.util.Locale.US, "$prefix%.2f جيجابايت", gb)
             mb >= 1.0 -> String.format(java.util.Locale.US, "$prefix%.1f ميجابايت", mb)

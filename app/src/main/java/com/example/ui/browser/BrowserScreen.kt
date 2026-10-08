@@ -154,10 +154,6 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
     val offlinePages by viewModel.offlinePages.collectAsState()
     val browsingStats by viewModel.browsingStats.collectAsState()
     val sniffedMedia by viewModel.sniffedMedia.collectAsState()
-    val currentPageMedia = remember(sniffedMedia, activeTab?.url) {
-        val pageUrl = activeTab?.url.orEmpty()
-        sniffedMedia.filter { MediaSniffer.mediaBelongsToPage(it, pageUrl) }
-    }
 
     val isAdBlock by viewModel.isAdBlockEnabled.collectAsState()
     val isDataSaver by viewModel.isDataSaverEnabled.collectAsState()
@@ -841,6 +837,8 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
                                 )
                                 settings.apply {
                                     javaScriptEnabled = true
+                                    javaScriptCanOpenWindowsAutomatically = true
+                                    setSupportMultipleWindows(true)
                                     domStorageEnabled = true
                                     databaseEnabled = true
                                     loadsImagesAutomatically = !isDataSaver
@@ -853,11 +851,13 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
                                     // Do not surface stale offline error pages while a network is available.
                                     // Data saving is handled by media/image policies instead of forcing cache-only navigation.
                                     cacheMode = WebSettings.LOAD_DEFAULT
-                                    javaScriptCanOpenWindowsAutomatically = true
-                                    setSupportMultipleWindows(false)
                                 }
-                                // Google/YouTube authentication uses cross-site cookies in WebView.
-                                CookieManager.getInstance().setAcceptThirdPartyCookies(this, activeTab?.isIncognito != true)
+
+                                // Google/YouTube authentication requires persistent cross-site cookies.
+                                CookieManager.getInstance().setAcceptCookie(true)
+                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                                }
                                 if (activeTab?.isIncognito == true) {
                                     settings.cacheMode = WebSettings.LOAD_NO_CACHE
                                     settings.saveFormData = false
@@ -922,7 +922,8 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
                                                 thumbnail = thumb,
                                                 duration = dur,
                                                 formatsJson = formats,
-                                                subsJson = subs
+                                                subsJson = subs,
+                                                userAgent = settings.userAgentString
                                             )
                                         },
                                         onSubtitleCue = { text, startMs, endMs, cueId ->
@@ -1099,10 +1100,6 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
                                         // 2. Video Sniffer interceptor
                                         if (MediaSniffer.isMediaResource(reqUrl)) {
                                             val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
-                                            // WebResourceRequest may omit User-Agent; use the exact WebView UA.
-                                            if (!reqHeaders.containsKey("User-Agent")) {
-                                                view?.settings?.userAgentString?.let { reqHeaders["User-Agent"] = it }
-                                            }
                                             val currentCookies = CookieManager.getInstance().getCookie(reqUrl)
                                                 ?: CookieManager.getInstance().getCookie(activeTab?.url ?: "https://www.youtube.com")
                                             if (!currentCookies.isNullOrBlank()) {
@@ -1236,7 +1233,7 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
             }
 
             // Floating Pulsing Video Sniffer Badge
-            if (currentPageMedia.isNotEmpty()) {
+            if (sniffedMedia.isNotEmpty()) {
                 ExtendedFloatingActionButton(
                     onClick = { showMediaSheet = true },
                     containerColor = MaterialTheme.colorScheme.primary,
@@ -1255,7 +1252,7 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
                     },
                     text = {
                         Text(
-                            text = if (currentPageMedia.size == 1) "تنزيل الفيديو" else "تنزيل (${currentPageMedia.size}) فيديوهات",
+                            text = if (sniffedMedia.size == 1) "تنزيل الفيديو" else "تنزيل (${sniffedMedia.size}) فيديوهات",
                             style = MaterialTheme.typography.labelLarge,
                             fontWeight = FontWeight.Bold
                         )
@@ -1282,7 +1279,7 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
     // Video Detection & Download Options Sheet
     if (showMediaSheet) {
         VideoDetectionDialog(
-            mediaList = currentPageMedia,
+            mediaList = sniffedMedia,
             currentDestination = downloadDest,
             onPlayOnline = { media, quality ->
                 showMediaSheet = false
@@ -1296,12 +1293,13 @@ fun BrowserScreen(viewModel: BrowserViewModel) {
                 activePlayingIsPartial = false
             },
             onStartDownload = { media, quality, withSub, dest ->
+                val subUrl = if (withSub) media.subtitles.firstOrNull()?.url else null
                 DownloadManager.startDownload(
                     context = context,
                     url = quality.url,
                     title = media.title,
                     quality = quality.label,
-                    subtitleUrl = null,
+                    subtitleUrl = subUrl,
                     mimeType = if (quality.isAudioOnly) quality.mimeType else media.mimeType,
                     pageUrl = media.pageUrl.ifBlank { activeTab?.url },
                     destination = dest

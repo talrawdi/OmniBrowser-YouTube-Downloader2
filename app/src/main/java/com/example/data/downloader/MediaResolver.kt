@@ -107,7 +107,11 @@ object MediaResolver {
      */
     private suspend fun resolveViaBackend(pageUrl: String, isAudio: Boolean): ResolvedStream? = withContext(Dispatchers.IO) {
         val encodedUrl = runCatching { URLEncoder.encode(pageUrl, "UTF-8") }.getOrDefault(pageUrl)
-        val endpoints = listOf("$DEFAULT_BACKEND_URL/resolve?url=$encodedUrl")
+        val endpoints = listOf(
+            "$DEFAULT_BACKEND_URL/resolve?url=$encodedUrl",
+            "$DEFAULT_BACKEND_URL/extract?url=$encodedUrl",
+            "$DEFAULT_BACKEND_URL/api/info?url=$encodedUrl"
+        )
 
         for (endpoint in endpoints) {
             try {
@@ -130,7 +134,7 @@ object MediaResolver {
                             if (streamUrl.isNotBlank() && (streamUrl.startsWith("http://") || streamUrl.startsWith("https://"))) {
                                 val quality = json.optString("quality", if (isAudio) "صوت عالي الجودة" else "دقة عالية HD")
                                 val mime = json.optString("mime_type", if (isAudio) "audio/mp4" else "video/mp4")
-                                val size = json.optLong("filesize", json.optLong("size_bytes", 0L))
+                                val size = json.optLong("size_bytes", 0L)
                                 return@withContext ResolvedStream(
                                     url = streamUrl,
                                     quality = quality,
@@ -152,7 +156,7 @@ object MediaResolver {
                                             url = fUrl,
                                             quality = f.optString("quality", "دقة عالية"),
                                             mimeType = f.optString("mime_type", if (isAud) "audio/mp4" else "video/mp4"),
-                                            sizeBytes = f.optLong("filesize", f.optLong("size_bytes", 0L)),
+                                            sizeBytes = f.optLong("size_bytes", 0L),
                                             isAudioOnly = isAud
                                         )
                                     }

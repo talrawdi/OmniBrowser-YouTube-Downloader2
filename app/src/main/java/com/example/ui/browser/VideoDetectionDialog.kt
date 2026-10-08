@@ -132,23 +132,8 @@ fun MediaItemCard(
     onDownload: (quality: SniffedQuality, withSubtitles: Boolean, destination: StorageDestination) -> Unit,
     onDownloadSubtitle: (subtitleUrl: String) -> Unit
 ) {
-    val availableQualities = remember(media.qualities) {
-        media.qualities
-            .filter { it.url.isNotBlank() }
-            .distinctBy { "${it.label.trim().lowercase()}|${it.url}" }
-            .sortedWith(compareBy<SniffedQuality> { it.isAudioOnly }.thenByDescending {
-                Regex("(\\d{3,4})p").find(it.label)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-            })
-    }
-    var selectedQuality by remember(availableQualities) {
-        mutableStateOf(availableQualities.firstOrNull() ?: SniffedQuality("جودة متاحة", media.originalUrl))
-    }
-    LaunchedEffect(availableQualities) {
-        if (availableQualities.none { it.url == selectedQuality.url }) {
-            selectedQuality = availableQualities.firstOrNull() ?: selectedQuality
-        }
-    }
-    var downloadWithSubtitles by remember { mutableStateOf(false) }
+    var selectedQuality by remember { mutableStateOf(media.qualities.firstOrNull() ?: SniffedQuality("720p HD", media.originalUrl)) }
+    var downloadWithSubtitles by remember { mutableStateOf(media.subtitles.isNotEmpty()) }
     var selectedDestination by remember { mutableStateOf(initialDestination) }
     var showQualityDropdown by remember { mutableStateOf(false) }
 
@@ -233,7 +218,7 @@ fun MediaItemCard(
                         expanded = showQualityDropdown,
                         onDismissRequest = { showQualityDropdown = false }
                     ) {
-                        availableQualities.forEach { quality ->
+                        media.qualities.forEach { quality ->
                             DropdownMenuItem(
                                 text = {
                                     Text("${quality.label} (${MediaSniffer.formatFileSize(quality.sizeBytes, quality.isEstimatedSize)})")
@@ -248,7 +233,31 @@ fun MediaItemCard(
                 }
             }
 
-            // Subtitle download is intentionally disabled: video-only downloads are more reliable.
+            // Subtitle Option
+            if (media.subtitles.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(
+                        checked = downloadWithSubtitles,
+                        onCheckedChange = { downloadWithSubtitles = it }
+                    )
+                    Text(
+                        text = "تنزيل ملف الترجمة المرفق تلقائياً (${media.subtitles.size} لغة مكتشفة)",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                OutlinedButton(
+                    onClick = { media.subtitles.firstOrNull()?.url?.let(onDownloadSubtitle) },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.Subtitles, contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("تنزيل الترجمة فقط")
+                }
+            }
+
             // Destination Selector Choice
             Row(
                 modifier = Modifier

@@ -47,8 +47,6 @@ object DownloadManager {
     // v2 avoids inheriting the old LOW-importance channel created by earlier APKs.
     private const val CHANNEL_ID = "downloads_channel_v2"
     private val activeJobs = ConcurrentHashMap<String, Job>()
-    private val downloadHeaders = ConcurrentHashMap<String, Map<String, String>>()
-    private val inFlightFingerprints = ConcurrentHashMap<String, String>()
     private val managerScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     var speedBoosterEnabled: Boolean = true
@@ -112,17 +110,7 @@ object DownloadManager {
         destination: StorageDestination = preferredDestination
     ): String {
         if (!initialized) init(context.applicationContext)
-        val cleanDownloadUrl = MediaSniffer.cleanRangeParams(url)
-        val fingerprint = downloadFingerprint(cleanDownloadUrl, quality, mimeType, pageUrl)
         val downloadId = java.util.UUID.randomUUID().toString()
-        val existingId = inFlightFingerprints.putIfAbsent(fingerprint, downloadId)
-        if (existingId != null) {
-            DiagnosticLogger.i("Downloader", "تم تجاهل تنزيل مكرر لنفس فيديو/جودة YouTube: $existingId")
-            return existingId
-        }
-        downloadHeaders[downloadId] = MediaSniffer.capturedHeaders[cleanDownloadUrl]
-            ?: MediaSniffer.capturedHeaders[url]
-            ?: emptyMap()
         val cleanName = sanitizeFileName(title)
         val ext = when {
             mimeType.contains("subrip", true) || mimeType.contains("srt", true) -> ".srt"
@@ -144,6 +132,8 @@ object DownloadManager {
             val subExt = if (subtitleUrl.endsWith(".srt")) ".srt" else ".vtt"
             subLocalPath = File(targetDir, "$cleanName$subExt").absolutePath
         }
+
+        val cleanDownloadUrl = MediaSniffer.cleanRangeParams(url)
 
         val entity = DownloadEntity(
             id = downloadId,
@@ -177,25 +167,18 @@ object DownloadManager {
             val effectiveEntity = entity.copy(
                 fileName = remoteName,
                 localPath = File(targetDir, remoteName).absolutePath,
-                // Subtitle downloads are explicit and separate from the video job.
-                subtitleUrl = null,
-                subtitlePath = null
+                subtitlePath = resolvedSubPath
             )
             db.downloadDao().insertOrUpdate(effectiveEntity)
             postDownloadNotification(appContext, effectiveEntity, 0L, 0L, "بدء التنزيل", ongoing = true)
             DiagnosticLogger.i("Downloader", "بدء تنزيل: '$title' بجودة $quality إلى: $targetPath")
 
-            enqueueDownloadWork(appContext, effectiveEntity.id)
-            // Subtitle fetching must never delay the video start. The logs showed
-            // the subtitle request blocking the actual video download for ~30s.
             if (!subtitleUrl.isNullOrBlank() && resolvedSubPath != null) {
-                managerScope.launch {
-                    downloadSubtitleTrack(subtitleUrl, resolvedSubPath)
-                }
+                downloadSubtitleTrack(subtitleUrl, resolvedSubPath)
             }
+
+            enqueueDownloadWork(appContext, effectiveEntity.id)
             } catch (e: Exception) {
-                inFlightFingerprints.remove(fingerprint, downloadId)
-                downloadHeaders.remove(downloadId)
                 DiagnosticLogger.e("Downloader", "تعذر تجهيز التنزيل: ${e.message}", e)
                 runCatching { AppDatabase.getInstance(context.applicationContext).downloadDao().updateStatus(downloadId, "FAILED", e.localizedMessage ?: "تعذر بدء التنزيل") }
             }
@@ -236,8 +219,6 @@ object DownloadManager {
         managerScope.launch {
             val db = AppDatabase.getInstance(context)
             val entity = db.downloadDao().getDownloadById(downloadId)
-            inFlightFingerprints.entries.removeIf { it.value == downloadId }
-            downloadHeaders.remove(downloadId)
             if (entity != null) {
                 if (deleteFile) {
                     deleteStoredFile(context, entity.localPath)
@@ -295,8 +276,8 @@ object DownloadManager {
                 val targetFile = File(entity.localPath)
                 targetFile.parentFile?.mkdirs()
 
-                // Local HLS playlist path: parse variants and concatenate permitted segments.
-                if (entity.url.contains(".m3u8", true) || entity.mimeType.contains("mpegurl", true) || entity.mimeType.contains("m3u8", true)) {
+                // If URL is an M3U8 playlist, use dedicated HLS Segment Downloader
+                if (entity.url.contains(".m3u8") || entity.mimeType.contains("mpegurl") || entity.mimeType.contains("m3u8")) {
                     downloadHlsStream(context, entity, targetFile, db)
                     return@launch
                 }
@@ -478,7 +459,14 @@ object DownloadManager {
                     DiagnosticLogger.s("Downloader", "اكتمل التنزيل بنجاح: '${entity.title}' (${MediaSniffer.formatFileSize(downloadedBytes)})")
                 }
             } catch (e: CancellationException) {
-                DiagnosticLogger.d("Downloader", "تم إيقاف عملية التنزيل")
+                // Pausing is not a failure: retain the partial file and persist PAUSED.
+                runCatching {
+                    val existing = db.downloadDao().getDownloadById(entity.id)
+                    if (existing != null && existing.status != "COMPLETED") {
+                        db.downloadDao().updateStatus(entity.id, "PAUSED", null)
+                    }
+                }
+                DiagnosticLogger.i("Downloader", "تم إيقاف التنزيل مؤقتاً مع حفظ الجزء المنزّل")
             } catch (e: Exception) {
                 DiagnosticLogger.e("Downloader", "فشل تنزيل '${entity.title}': ${e.message}", e)
                 db.downloadDao().updateStatus(entity.id, "FAILED", e.localizedMessage ?: "حدث خطأ في الاتصال بالخادم")
@@ -486,8 +474,6 @@ object DownloadManager {
             } finally {
                 try { raf?.close() } catch (_: Exception) {}
                 activeJobs.remove(entity.id)
-                inFlightFingerprints.entries.removeIf { it.value == entity.id }
-                downloadHeaders.remove(entity.id)
             }
         }
         activeJobs[entity.id] = job
@@ -640,17 +626,12 @@ object DownloadManager {
     ) = withContext(Dispatchers.IO) {
         DiagnosticLogger.i("Downloader", "بدء تنزيل تدفق HLS M3U8: '${entity.title}'")
         val baseUrl = entity.url
-        val sessionHeaders = downloadHeaders[entity.id]
-            ?: MediaSniffer.capturedHeaders[baseUrl]
-            ?: emptyMap()
 
         val req = Request.Builder()
             .url(baseUrl)
-            .header("User-Agent", sessionHeaders["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36")
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36")
             .apply {
-                sessionHeaders["Cookie"]?.let { header("Cookie", it) }
-                sessionHeaders["Referer"]?.let { header("Referer", it) }
-                    ?: entity.pageUrl?.let { header("Referer", it) }
+                entity.pageUrl?.let { header("Referer", it) }
             }
             .build()
 
@@ -663,10 +644,9 @@ object DownloadManager {
         if (playlistContent.contains("#EXT-X-KEY", ignoreCase = true)) {
             throw IllegalStateException("تدفق HLS مشفر؛ لا يمكن تنزيله دون مسار فك تشفير مسموح")
         }
-        // fMP4 playlists are supported by writing the initialization map before
-        // media fragments. Byte-range playlists still require a range-aware parser.
-        if (playlistContent.contains("#EXT-X-BYTERANGE", ignoreCase = true)) {
-            throw IllegalStateException("قائمة HLS تستخدم byte-range غير مدعوم بأمان")
+        if (playlistContent.contains("#EXT-X-MAP", ignoreCase = true) ||
+            playlistContent.contains("#EXT-X-BYTERANGE", ignoreCase = true)) {
+            throw IllegalStateException("تدفق HLS يستخدم fMP4 أو byte-range ويحتاج remux متخصص")
         }
         var mediaPlaylistUrl = baseUrl
         var mediaPlaylistContent = playlistContent
@@ -692,18 +672,13 @@ object DownloadManager {
             }
         }
 
-        // Extract optional fMP4 initialization map and media segment URLs.
-        var initSegmentUrl: String? = null
-        val mapLine = mediaPlaylistContent.lines().firstOrNull { it.startsWith("#EXT-X-MAP:", true) }
-        if (mapLine != null) {
-            val uriValue = Regex("URI=\"([^\"]+)\"").find(mapLine)?.groupValues?.getOrNull(1)
-            if (!uriValue.isNullOrBlank()) initSegmentUrl = resolveUrl(mediaPlaylistUrl, uriValue)
-        }
+        // Extract segment URLs
         val segmentUrls = mutableListOf<String>()
         val lines = mediaPlaylistContent.lines()
         if (mediaPlaylistContent.contains("#EXT-X-KEY", ignoreCase = true) ||
+            mediaPlaylistContent.contains("#EXT-X-MAP", ignoreCase = true) ||
             mediaPlaylistContent.contains("#EXT-X-BYTERANGE", ignoreCase = true)) {
-            throw IllegalStateException("صيغة HLS مشفرة أو byte-range وغير مدعومة")
+            throw IllegalStateException("صيغة HLS هذه غير مدعومة آمنًا للتجميع الحالي")
         }
         for (line in lines) {
             val trimmed = line.trim()
@@ -720,8 +695,7 @@ object DownloadManager {
 
         var totalDownloadedBytes = 0L
         val totalSegments = segmentUrls.size
-        // Segment sizes vary; keep the total unknown unless the caller supplied a confirmed value.
-        val confirmedTotalBytes = entity.totalBytes.takeIf { it > 0L } ?: 0L
+        var estimatedTotalBytes = entity.totalBytes.takeIf { it > 0L } ?: 0L
         var lastNotificationAt = 0L
         targetFile.delete()
 
@@ -729,51 +703,21 @@ object DownloadManager {
             var lastSpeedCheck = System.currentTimeMillis()
             var bytesSinceSpeedCheck = 0L
 
-            if (initSegmentUrl != null) {
-                val initReq = Request.Builder()
-                    .url(initSegmentUrl!!)
-                    .header("User-Agent", sessionHeaders["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Mobile)")
-                    .apply {
-                        sessionHeaders["Cookie"]?.let { header("Cookie", it) }
-                        sessionHeaders["Referer"]?.let { header("Referer", it) }
-                    }
-                    .build()
-                okHttpClient.newCall(initReq).execute().use { initResp ->
-                    if (!initResp.isSuccessful) throw IllegalStateException("فشل تنزيل تهيئة HLS: ${initResp.code}")
-                    val initBytes = initResp.body?.bytes() ?: ByteArray(0)
-                    if (initBytes.isEmpty()) throw IllegalStateException("تهيئة HLS فارغة")
-                    output.write(initBytes)
-                    totalDownloadedBytes += initBytes.size
-                }
-            }
-
             for ((index, segUrl) in segmentUrls.withIndex()) {
                 if (!coroutineContext.isActive) break
 
                 val segReq = Request.Builder()
                     .url(segUrl)
-                    .header("User-Agent", sessionHeaders["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36")
-                    .apply {
-                        sessionHeaders["Cookie"]?.let { header("Cookie", it) }
-                        sessionHeaders["Referer"]?.let { header("Referer", it) }
-                            ?: entity.pageUrl?.let { header("Referer", it) }
-                    }
+                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36")
+                    .apply { entity.pageUrl?.let { header("Referer", it) } }
                     .build()
 
                 val segResp = okHttpClient.newCall(segReq).execute()
-                if (!segResp.isSuccessful) {
-                    val code = segResp.code
-                    segResp.close()
-                    throw IllegalStateException("فشل تنزيل مقطع HLS ${index + 1}/${segmentUrls.size}: $code")
-                }
-                segResp.use { response ->
-                    val bytes = response.body?.bytes() ?: ByteArray(0)
-                    if (bytes.isEmpty()) throw IllegalStateException("مقطع HLS فارغ: ${index + 1}")
+                if (segResp.isSuccessful) {
+                    val bytes = segResp.body?.bytes() ?: ByteArray(0)
                     output.write(bytes)
                     totalDownloadedBytes += bytes.size
                     bytesSinceSpeedCheck += bytes.size
-                    // Do not infer a total from one segment. HLS segment durations
-                    // and byte sizes vary substantially.
 
                     val now = System.currentTimeMillis()
                     val elapsed = now - lastSpeedCheck
@@ -784,10 +728,10 @@ object DownloadManager {
                         bytesSinceSpeedCheck = 0L
                     }
 
-                    db.downloadDao().updateProgress(entity.id, totalDownloadedBytes, confirmedTotalBytes, speed)
+                    db.downloadDao().updateProgress(entity.id, totalDownloadedBytes, estimatedTotalBytes, speed)
                     val notificationNow = System.currentTimeMillis()
                     if (notificationNow - lastNotificationAt >= 750L) {
-                        postDownloadNotification(context, entity, totalDownloadedBytes, confirmedTotalBytes, "جارٍ تنزيل البث", ongoing = true)
+                        postDownloadNotification(context, entity, totalDownloadedBytes, estimatedTotalBytes, "جارٍ تنزيل البث", ongoing = true)
                         lastNotificationAt = notificationNow
                     }
                 }
@@ -841,21 +785,28 @@ object DownloadManager {
             ?: YouTubeExtractor.extractVideoId(currentUrl)
             ?: YouTubeExtractor.extractVideoId(entity.pageUrl.orEmpty())
 
-        // Prefer the latest headers captured from the real WebView media request.
         val savedHeaders = MediaSniffer.capturedHeaders[currentUrl]
             ?: MediaSniffer.capturedHeaders[MediaSniffer.cleanRangeParams(currentUrl)]
-            ?: downloadHeaders[entity.id]?.takeIf { it.isNotEmpty() }
             ?: emptyMap()
 
         val webUserAgent = savedHeaders["User-Agent"]
             ?: "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+        val clientType = runCatching { Uri.parse(currentUrl).getQueryParameter("c") }.getOrNull().orEmpty()
+        val userAgentsToTry = (listOfNotNull(
+            savedHeaders["User-Agent"],
+            clientType.takeIf { it.isNotBlank() }?.let(YouTubeExtractor::getUserAgentForClient),
+            YouTubeExtractor.getUserAgentForClient("ANDROID_VR"),
+            YouTubeExtractor.getUserAgentForClient("IOS"),
+            YouTubeExtractor.getUserAgentForClient("ANDROID"),
+            webUserAgent
+        ) + listOf(
+            "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+        )).distinct()
 
-        val referer = savedHeaders["Referer"] ?: entity.pageUrl ?: "https://www.youtube.com/"
-        val cookies = savedHeaders["Cookie"] ?: runCatching {
+        val referer = entity.pageUrl ?: "https://www.youtube.com/"
+        val cookies = runCatching {
             CookieManager.getInstance().getCookie("https://www.youtube.com")
-                ?: CookieManager.getInstance().getCookie("https://m.youtube.com")
         }.getOrNull().orEmpty()
-        DiagnosticLogger.d("Downloader", "رؤوس تنزيل YouTube: UA=${webUserAgent.take(42)}..., Cookie=${if (cookies.isBlank()) "غير موجودة" else "موجودة"}, Referer=$referer")
 
         var downloadedBytes = if (resume && targetFile.exists()) targetFile.length() else 0L
         if (!resume && targetFile.exists()) {
@@ -875,23 +826,19 @@ object DownloadManager {
         val isAudio = entity.mimeType.contains("audio") || entity.quality.contains("صوت")
 
         // Helper function to attempt streaming from a given URL
-        suspend fun tryStreamUrl(urlToTry: String, attemptHeaders: Map<String, String> = savedHeaders): Boolean {
+        suspend fun tryStreamUrl(urlToTry: String, userAgent: String = webUserAgent): Boolean {
             var raf: RandomAccessFile? = null
             try {
-                val attemptUserAgent = attemptHeaders["User-Agent"] ?: webUserAgent
-                val attemptReferer = attemptHeaders["Referer"] ?: referer
-                val attemptCookies = attemptHeaders["Cookie"] ?: cookies
                 val reqBuilder = Request.Builder()
                     .url(urlToTry)
-                    .header("User-Agent", attemptUserAgent)
+                    .header("User-Agent", userAgent)
                     .header("Accept", "*/*")
                     .header("Connection", "keep-alive")
 
                 if (!urlToTry.contains("flokinet") && !urlToTry.contains("invidious")) {
-                    // Media requests made by WebView do not carry a page Origin.
-                    // Adding it to googlevideo requests can turn a valid signed URL into 403.
-                    reqBuilder.header("Referer", attemptReferer)
-                    if (attemptCookies.isNotBlank()) reqBuilder.header("Cookie", attemptCookies)
+                    reqBuilder.header("Referer", referer)
+                    reqBuilder.header("Origin", "https://www.youtube.com")
+                    if (cookies.isNotBlank()) reqBuilder.header("Cookie", cookies)
                 }
 
                 // Always request the byte range, including the initial bytes=0-
@@ -899,15 +846,31 @@ object DownloadManager {
                 reqBuilder.header("Range", "bytes=$downloadedBytes-")
 
                 val resp = okHttpClient.newCall(reqBuilder.build()).execute()
-                val responseType = resp.header("Content-Type").orEmpty()
-                val responseLength = resp.header("Content-Length") ?: "غير محدد"
-                DiagnosticLogger.d("Downloader", "استجابة رابط YouTube: HTTP ${resp.code}, type=$responseType, length=$responseLength, range=${resp.header("Content-Range") ?: "غير محدد"}")
-                if (!resp.isSuccessful && resp.code != 206) {
+                if ((!resp.isSuccessful && resp.code != 206) ||
+                    resp.header("Content-Type").orEmpty().contains("text/html", ignoreCase = true)
+                ) {
+                    DiagnosticLogger.w("Downloader", "YouTube stream rejected: HTTP " + resp.code + ", type=" + resp.header("Content-Type").orEmpty())
                     resp.close()
                     return false
                 }
 
-                val body = resp.body ?: return false
+                val body = resp.body ?: run {
+                    resp.close()
+                    return false
+                }
+                val responseType = resp.header("Content-Type").orEmpty()
+                if (responseType.contains("yt-ump", ignoreCase = true) ||
+                    responseType.contains("text/html", ignoreCase = true)) {
+                    DiagnosticLogger.w("Downloader", "YouTube returned a non-file protocol response; refreshing extraction")
+                    resp.close()
+                    return false
+                }
+                DiagnosticLogger.d(
+                    "Downloader",
+                    "YouTube response: HTTP " + resp.code +
+                        ", type=" + resp.header("Content-Type").orEmpty() +
+                        ", bytes=" + body.contentLength()
+                )
                 if (downloadedBytes > 0L && resp.code == 200) {
                     // A server that ignores Range must not be appended to a partial file.
                     downloadedBytes = 0L
@@ -918,15 +881,14 @@ object DownloadManager {
                     ?.toLongOrNull()
                     ?: 0L
                 val contentLen = body.contentLength()
-                if (contentRangeTotal > 0L) {
+                if (contentLen > 0) {
+                    totalBytes = when {
+                        contentRangeTotal > 0L -> contentRangeTotal
+                        resp.code == 206 -> downloadedBytes + contentLen
+                        else -> contentLen
+                    }
+                } else if (contentRangeTotal > 0L) {
                     totalBytes = contentRangeTotal
-                } else if (resp.code == 200 && contentLen > 0L) {
-                    totalBytes = contentLen
-                } else if (totalBytes <= 0L) {
-                    // A 206 response without Content-Range is only an unknown fragment.
-                    // Never promote it to a completed video.
-                    resp.close()
-                    return false
                 }
 
                 raf = RandomAccessFile(targetFile, "rw")
@@ -973,7 +935,7 @@ object DownloadManager {
                 raf.close()
                 raf = null
                 resp.close()
-                return totalBytes > 0L && downloadedBytes >= totalBytes
+                return downloadedBytes >= (if (totalBytes > 0) (totalBytes * 0.95).toLong() else 100 * 1024L)
             } catch (e: Exception) {
                 DiagnosticLogger.d("Downloader", "خطأ أثناء الدفق من الرابط: ${e.message}")
                 return false
@@ -982,25 +944,31 @@ object DownloadManager {
             }
         }
 
-        // 1. Primary path: stream the exact URL captured by WebView with its live headers.
-        DiagnosticLogger.i("Downloader", "محاولة رابط WebView المباشر أولاً${if (savedHeaders.isNotEmpty()) " مع الرؤوس المحفوظة" else " بدون رؤوس محفوظة"}")
-        var success = tryStreamUrl(currentUrl, savedHeaders)
+        // Try the extracted client first, then compatible clients if YouTube rejects its URL.
+        var success = false
+        for (userAgent in userAgentsToTry) {
+            success = tryStreamUrl(currentUrl, userAgent)
+            if (success || !isActive) break
+        }
 
-        // 2. Only after the direct WebView URL fails, resolve a fresh fallback stream.
+        // If failed, auto-resolve a fresh direct stream via YouTubeExtractor and retry its supported clients.
         if (!success && isActive && videoId != null) {
             DiagnosticLogger.i("Downloader", "تجديد رابط البث تلقائياً عبر المحلل الموزع...")
             val resolved = YouTubeExtractor.resolveDirectStream(videoId, isAudio)
             if (resolved != null && resolved.url.isNotBlank()) {
                 currentUrl = resolved.url
-                val freshHeaders = mapOf(
-                    "User-Agent" to YouTubeExtractor.getUserAgentForClient("ANDROID_VR"),
-                    "Referer" to "https://www.youtube.com/watch?v=$videoId"
-                )
-                success = tryStreamUrl(currentUrl, freshHeaders)
+                for (userAgent in userAgentsToTry) {
+                    success = tryStreamUrl(currentUrl, userAgent)
+                    if (success || !isActive) break
+                }
             }
         }
 
         if (!success || downloadedBytes < 15 * 1024) {
+            DiagnosticLogger.w(
+                "Downloader",
+                "YouTube download incomplete: received=" + downloadedBytes + ", expected=" + totalBytes
+            )
             targetFile.delete()
             throw IllegalStateException("تعذر إكمال تنزيل الفيديو بعد المحاولة من جميع المنافذ.")
         }
@@ -1040,24 +1008,6 @@ object DownloadManager {
         )
         postDownloadNotification(context, entity, downloadedBytes, downloadedBytes, "اكتمل التنزيل", ongoing = false)
         DiagnosticLogger.s("Downloader", "اكتمل تنزيل يوتيوب بنجاح: '${entity.title}' (${MediaSniffer.formatFileSize(downloadedBytes)})")
-    }
-
-    private fun isValidMediaContainer(file: File, mimeType: String): Boolean {
-        if (!file.exists() || file.length() < 32L) return false
-        return try {
-            FileInputStream(file).use { input ->
-                val header = ByteArray(32)
-                val count = input.read(header)
-                if (count < 12) return false
-                val isMp4 = header[4] == 'f'.code.toByte() && header[5] == 't'.code.toByte() &&
-                    header[6] == 'y'.code.toByte() && header[7] == 'p'.code.toByte()
-                val isWebm = header[0] == 0x1A.toByte() && header[1] == 0x45.toByte() &&
-                    header[2] == 0xDF.toByte() && header[3] == 0xA3.toByte()
-                val isMpegAudio = header[0] == 'I'.code.toByte() && header[1] == 'D'.code.toByte() &&
-                    header[2] == '3'.code.toByte()
-                isMp4 || isWebm || (mimeType.startsWith("audio/") && isMpegAudio)
-            }
-        } catch (_: Exception) { false }
     }
 
     private fun resolveUrl(baseUrl: String, relativeUrl: String): String {
@@ -1215,18 +1165,6 @@ object DownloadManager {
             index++
         } while (candidate.exists() && index < 10_000)
         return candidate.name
-    }
-
-    private fun downloadFingerprint(url: String, quality: String, mimeType: String, pageUrl: String?): String {
-        val videoId = YouTubeExtractor.extractVideoId(pageUrl.orEmpty())
-            ?: YouTubeExtractor.extractVideoId(url)
-        if (videoId != null) {
-            val itag = runCatching { Uri.parse(url).getQueryParameter("itag").orEmpty() }.getOrDefault("")
-            val audio = mimeType.contains("audio", true) || quality.contains("صوت")
-            val variant = if (itag.isNotBlank()) itag else quality.trim()
-            return "youtube:$videoId:$variant:$audio"
-        }
-        return "url:${url.lowercase()}:$mimeType"
     }
 
     private fun sanitizeFileName(name: String): String {

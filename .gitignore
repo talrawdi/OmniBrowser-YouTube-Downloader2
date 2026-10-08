@@ -16,3 +16,7 @@
 local.properties
 .env
 debug.keystore
+
+# Aider Studio (auto-added)
+REPO_MAP.md
+.aider/

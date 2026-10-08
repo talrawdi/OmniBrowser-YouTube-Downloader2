@@ -23,6 +23,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.delay
 import com.example.data.downloader.DownloadManager
 import com.example.data.downloader.MediaSniffer
 import com.example.data.downloader.StorageDestination
@@ -228,6 +229,14 @@ fun DownloadItemRow(
     onOpenDiagnostics: () -> Unit = {}
 ) {
     var moveMenuExpanded by remember { mutableStateOf(false) }
+    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(download.id, download.status, download.downloadedBytes) {
+        while (download.status == "DOWNLOADING") {
+            nowMs = System.currentTimeMillis()
+            delay(1000L)
+        }
+        nowMs = System.currentTimeMillis()
+    }
     val progress = if (download.totalBytes > 0) {
         (download.downloadedBytes.toFloat() / download.totalBytes.toFloat()).coerceIn(0f, 1f)
     } else 0f
@@ -334,29 +343,45 @@ fun DownloadItemRow(
                     trackColor = MaterialTheme.colorScheme.surfaceVariant
                 )
 
+                val elapsedMs = ((download.completedAt ?: nowMs) - download.createdAt).coerceAtLeast(0L)
+                val remainingBytes = (download.totalBytes - download.downloadedBytes).coerceAtLeast(0L)
+                val etaSeconds = if (download.speedBytesPerSec > 0L && download.totalBytes > download.downloadedBytes) {
+                    remainingBytes / download.speedBytesPerSec
+                } else 0L
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 6.dp),
+                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "${MediaSniffer.formatFileSize(download.downloadedBytes)} / ${MediaSniffer.formatFileSize(download.totalBytes)}",
+                        text = if (download.totalBytes > 0L) {
+                            "${MediaSniffer.formatFileSize(download.downloadedBytes)} / ${MediaSniffer.formatFileSize(download.totalBytes)}"
+                        } else {
+                            "تم تنزيل ${MediaSniffer.formatFileSize(download.downloadedBytes)} • الحجم النهائي غير متاح"
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-
                     if (download.status == "DOWNLOADING" && download.speedBytesPerSec > 0) {
                         Text(
-                            text = "${MediaSniffer.formatFileSize(download.speedBytesPerSec)}/ثانية",
+                            text = "${MediaSniffer.formatFileSize(download.speedBytesPerSec)}/ث",
                             style = MaterialTheme.typography.bodySmall,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary
                         )
                     }
                 }
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("الوقت: ${formatElapsed(elapsedMs)}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (download.status == "DOWNLOADING" && etaSeconds > 0L) {
+                        Text("متبقٍ تقريباً: ${formatElapsed(etaSeconds * 1000L)}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                    } else if (download.status == "COMPLETED") {
+                        Text("اكتمل: ${formatDateTime(download.completedAt ?: nowMs)}", style = MaterialTheme.typography.labelSmall, color = Color(0xFF2E7D32))
+                    }
+                }
             }
-
             // In case of error
             if (download.status == "FAILED" && !download.errorReason.isNullOrBlank()) {
                 Surface(
@@ -480,6 +505,18 @@ fun DownloadItemRow(
         }
     }
 }
+
+private fun formatElapsed(ms: Long): String {
+    val totalSeconds = (ms / 1000L).coerceAtLeast(0L)
+    val hours = totalSeconds / 3600L
+    val minutes = (totalSeconds % 3600L) / 60L
+    val seconds = totalSeconds % 60L
+    return if (hours > 0) String.format(java.util.Locale.getDefault(), "%02d:%02d:%02d", hours, minutes, seconds)
+    else String.format(java.util.Locale.getDefault(), "%02d:%02d", minutes, seconds)
+}
+
+private fun formatDateTime(timestamp: Long): String =
+    java.text.SimpleDateFormat("yyyy/MM/dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date(timestamp))
 
 private fun shareFile(context: Context, filePath: String) {
     try {

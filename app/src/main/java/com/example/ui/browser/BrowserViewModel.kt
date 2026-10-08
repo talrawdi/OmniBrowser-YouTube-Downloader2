@@ -35,11 +35,10 @@ class BrowserViewModel(application: Application) : AndroidViewModel(application)
     // Tabs: restore normal tabs, then open a fresh tab for this session.
     private val tabPrefs = application.getSharedPreferences("browser_tabs_state", Context.MODE_PRIVATE)
     private val restoredTabs = loadPersistedTabs()
-    private val _tabs = MutableStateFlow<List<BrowserTab>>(
-        (restoredTabs + BrowserTab(url = "about:blank", title = "علامة تبويب جديدة")).ifEmpty {
-            listOf(BrowserTab(url = "https://www.google.com", title = "Google"))
-        }
-    )
+    private val initialTabs = restoredTabs.ifEmpty {
+        listOf(BrowserTab(url = "about:blank", title = "علامة تبويب جديدة"))
+    }
+    private val _tabs = MutableStateFlow(initialTabs)
     val tabs: StateFlow<List<BrowserTab>> = _tabs.asStateFlow()
 
     private val _activeTabId = MutableStateFlow<String>(_tabs.value.last().id)
