@@ -56,6 +56,8 @@ object MediaSniffer {
     private val recentYouTubeEvents = ConcurrentHashMap<String, Long>()
     @Volatile private var currentPageUrl: String = ""
     val capturedHeaders = ConcurrentHashMap<String, Map<String, String>>()
+    // Maps YouTube itag to the latest URL actually requested by the WebView.
+    private val capturedUrlsByItag = ConcurrentHashMap<Int, String>()
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -175,6 +177,7 @@ object MediaSniffer {
                                         formats.push({
                                             quality: f.qualityLabel || (f.height ? f.height + 'p' : ''),
                                             height: parseInt(f.height) || 0,
+                                            itag: parseInt(f.itag) || 0,
                                             url: fUrl,
                                             cipher: (f.signatureCipher || f.cipher || ''),
                                             mimeType: f.mimeType || 'video/mp4',
@@ -198,6 +201,7 @@ object MediaSniffer {
                                         formats.push({
                                             quality: isAudio ? 'صوت فقط MP3/M4A (عالي النقاء)' : (f.qualityLabel || (f.height ? f.height + 'p' : '')),
                                             height: parseInt(f.height) || 0,
+                                            itag: parseInt(f.itag) || 0,
                                             url: fUrl,
                                             cipher: (f.signatureCipher || f.cipher || ''),
                                             mimeType: f.mimeType || (isAudio ? 'audio/mp4' : 'video/mp4'),
@@ -262,6 +266,8 @@ object MediaSniffer {
         seenUrls.clear()
         seenVideoIds.clear()
         recentYouTubeEvents.clear()
+        capturedUrlsByItag.clear()
+        capturedHeaders.clear()
         _sniffedMediaList.value = emptyList()
         DiagnosticLogger.d("MediaSniffer", "إعادة ضبط كاشف الوسائط للصفحة: $pageUrl")
 
@@ -383,11 +389,18 @@ object MediaSniffer {
                 for (i in 0 until formatsArray.length()) {
                     val obj = formatsArray.getJSONObject(i)
                     val rawUrl = obj.optString("url")
+                    val itag = obj.optInt("itag", 0)
                     val cipher = obj.optString("cipher")
                     val resolvedUrl = if (cipher.isNotBlank()) {
                         YouTubeExtractor.resolveCipherUrl(cipher) ?: rawUrl
                     } else rawUrl
-                    val url = cleanRangeParams(resolvedUrl)
+                    // Prefer the exact videoplayback URL observed from WebView for this itag.
+                    val observedUrl = capturedUrlsByItag[itag]
+                    val selectedUrl = observedUrl ?: resolvedUrl
+                    val url = cleanRangeParams(selectedUrl)
+                    if (observedUrl != null) {
+                        DiagnosticLogger.d("MediaSniffer", "تم ربط itag=$itag بالرابط الفعلي الملتقط من WebView")
+                    }
                     val isAudio = obj.optBoolean("isAudio", false)
                     val height = obj.optInt("height", 0)
                     if (!isAudio && height <= 0) continue
@@ -466,6 +479,10 @@ object MediaSniffer {
         if (url.isBlank() || url.startsWith("blob:") || url.startsWith("data:")) return
 
         val cleanUrl = cleanRangeParams(url)
+        val itag = runCatching { Uri.parse(cleanUrl).getQueryParameter("itag")?.toIntOrNull() ?: 0 }.getOrDefault(0)
+        if (itag > 0 && (cleanUrl.contains("googlevideo.com") || cleanUrl.contains("videoplayback"))) {
+            capturedUrlsByItag[itag] = cleanUrl
+        }
         // Keep the newest request headers; the actual media request can arrive
         // after a short probe that used the same cleaned URL.
         if (headers.isNotEmpty()) {
